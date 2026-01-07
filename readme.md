@@ -4,6 +4,8 @@
 
 Created by [@neilveil](https://github.com/neilveil)
 
+**GitHub Repository:** [https://github.com/neilveil/renderx](https://github.com/neilveil/renderx)
+
 RenderX makes your React/Vite/SPA applications SEO-friendly by automatically rendering pages for search engines and bots. Regular users get fast static files, while bots get fully rendered HTML.
 
 ## What It Does

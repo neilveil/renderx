@@ -1,0 +1,9 @@
+.cache
+.cursor
+.git
+.gitignore
+*.md
+demo-app
+node_modules
+readme.md
+tmp

@@ -143,12 +143,12 @@ curl http://localhost:8080 -H "Origin: https://my-app.com" -H "User-Agent: Googl
 
 -   **Direct port 80**: To use port 80 directly without a reverse proxy server, run Docker with `--cap-add=NET_BIND_SERVICE` and map port 80. The `--cap-add=NET_BIND_SERVICE` flag grants the container permission to bind to privileged ports (ports below 1024) without running as root, which is needed since RenderX runs as a non-root user for security. This allows RenderX to bind to port 80 and handle all incoming HTTP traffic directly.
 
-    ```bash
-    docker run --cap-add=NET_BIND_SERVICE -p 80:8080 \
-      -v $(pwd)/hosts:/app/hosts \
-      -v $(pwd)/config.json:/app/config.json \
-      neilveil/renderx
-    ```
+```bash
+docker run --cap-add=NET_BIND_SERVICE -p 80:8080 \
+    -v $(pwd)/hosts:/app/hosts \
+    -v $(pwd)/config.json:/app/config.json \
+    neilveil/renderx
+```
 
 -   **With reverse proxy**: If you're using a reverse proxy server (nginx, Apache, Caddy, Traefik, etc.), use `-p 8080:8080` (or any other port) and configure your reverse proxy to route traffic from port 80 to your chosen port where RenderX is listening.
 
@@ -207,7 +207,7 @@ All global settings are optional and will use defaults if not specified:
 | `bots`                 | string[] | No       | See below     | Array of bot user agent strings to detect. If not specified, defaults to:<br>- Search engines: `Googlebot`, `bingbot`, `Slurp`, `DuckDuckBot`, `Baiduspider`, `YandexBot`, `Applebot`<br>- Social media bots: `facebookexternalhit`, `Twitterbot`, `LinkedInBot`, `Pinterestbot`, `Slack`, `WhatsApp`, `TelegramBot`, `vkShare`<br>- AI bots: `GPTBot`, `ChatGPT-User`, `Google-Extended`, `ClaudeBot`, `Claude-Web`, `GrokBot`, `meta-externalagent`, `meta-externalfetcher`, `PerplexityBot`, `Amazonbot`, `CCBot`, `ia_archiver`, `YouBot`, `Neevabot`<br>- Other: `headlessbot` |
 | `hosts`                | array    | Yes      | -             | Array of host configurations (see Host Settings below)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 
-### Host Settings
+### Hosts Settings
 
 Each host configuration supports:
 

@@ -53,7 +53,7 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
 CMD ["node", "dist/index.js"]
 
 # docker build -t neilveil/renderx:latest .
-# docker tag neilveil/renderx:latest neilveil/renderx:v1.0.0
+# docker tag neilveil/renderx:latest neilveil/renderx:1.0.0
 # docker login
 # docker push neilveil/renderx:latest
-# docker push neilveil/renderx:v1.0.0
+# docker push neilveil/renderx:1.0.0

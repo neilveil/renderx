@@ -1,41 +1,27 @@
 import { Browser, BrowserContext, chromium, Page } from 'playwright'
-import { optimizeHtmlForSEO } from './htmlOptimizer'
+import { acquire, destroyPool, initPool, release } from './contextPool'
 import { logger } from './logger'
+import { getConfig } from './config'
+import { initRenderQueue } from './renderQueue'
 
-import { HtmlOptimizerOptions } from './htmlOptimizer'
-import { RenderingStrategy } from './config'
-
-export interface RenderConfig {
+export type RenderConfig = {
     timeoutMs: number
-    maxConcurrency: number
-    rootSelector?: string // Optional root selector for SPA detection (default: '#root')
-    htmlOptimizerOptions?: HtmlOptimizerOptions // Optional HTML optimizer configuration
-    strategy?: RenderingStrategy // Rendering strategy - if 'ssr', HTML optimization is skipped
+    parallelRenders: number
+    rootSelector?: string
 }
 
-// Constants
-const DEFAULT_VIEWPORT_WIDTH = 1920
-const DEFAULT_VIEWPORT_HEIGHT = 1080
 const BROWSER_CLEANUP_TIMEOUT_MS = 5000
 
 let browser: Browser | null = null
 let browserLaunchPromise: Promise<Browser> | null = null
-let activeRequests = 0
 
-/**
- * Launches a browser instance, ensuring only one launch happens at a time.
- * Uses a promise-based lock to prevent race conditions.
- * @returns Promise resolving to the browser instance
- */
 const launchBrowser = async (): Promise<Browser> => {
     if (browser) return browser
 
-    // Use existing promise if launch is already in progress
     if (browserLaunchPromise) {
         return browserLaunchPromise
     }
 
-    // Create launch promise atomically
     browserLaunchPromise = (async () => {
         try {
             browser = await chromium.launch({
@@ -60,7 +46,6 @@ const launchBrowser = async (): Promise<Browser> => {
             const error = err as Error
             browserLaunchPromise = null
 
-            // Check if it's a browser installation error
             if (error.message.includes("Executable doesn't exist") || error.message.includes('playwright')) {
                 logger.error('Playwright browsers are not installed!')
                 logger.error('Please run: npx playwright install chromium')
@@ -76,14 +61,6 @@ const launchBrowser = async (): Promise<Browser> => {
     return browserLaunchPromise
 }
 
-/**
- * Waits for page to be ready using event-based approach.
- * Waits for: page load → scripts execute → React renders → network idle
- * @param page - Playwright page instance
- * @param url - URL being loaded
- * @param config - Render configuration with timeout
- * @param alreadyNavigated - Whether page has already navigated
- */
 const waitForReadiness = async (
     page: Page,
     url: string,
@@ -92,10 +69,9 @@ const waitForReadiness = async (
 ): Promise<void> => {
     const { timeoutMs } = config
     const startTime = Date.now()
-    const remainingTimeout = () => Math.max(1000, timeoutMs - (Date.now() - startTime))
+    const remainingTimeout = (): number => Math.max(1000, timeoutMs - (Date.now() - startTime))
 
     try {
-        // Step 1: Navigate and wait for page load event
         if (!alreadyNavigated) {
             await page.goto(url, {
                 waitUntil: 'load',
@@ -105,15 +81,12 @@ const waitForReadiness = async (
             await page.waitForLoadState('load', { timeout: remainingTimeout() })
         }
 
-        // Step 2: Wait for network idle (ensures scripts have loaded)
         try {
             await page.waitForLoadState('networkidle', { timeout: Math.min(15000, remainingTimeout()) })
         } catch {
-            // Continue if timeout
+            // continue
         }
 
-        // Step 3: Wait for React/SPA to render
-        // Try multiple common root selectors if custom one not provided
         const rootSelector = config.rootSelector || '#root'
         const rootSelectors = [rootSelector, '#app', '[data-reactroot]', 'body > *']
         let rendered = false
@@ -127,11 +100,10 @@ const waitForReadiness = async (
                 rendered = true
                 break
             } catch {
-                // Try next selector
+                // try next
             }
         }
 
-        // Fallback: check for text content if no children found
         if (!rendered) {
             try {
                 await page.waitForFunction(
@@ -145,15 +117,14 @@ const waitForReadiness = async (
                     }
                 )
             } catch {
-                // Continue even if React doesn't render
+                // continue
             }
         }
 
-        // Step 4: Wait for network idle again (for API calls after React renders)
         try {
             await page.waitForLoadState('networkidle', { timeout: Math.min(10000, remainingTimeout()) })
         } catch {
-            // Continue if timeout
+            // continue
         }
     } catch (err) {
         const error = err as Error
@@ -164,14 +135,8 @@ const waitForReadiness = async (
 }
 
 /**
- * Renders a URL using Playwright, returning optimized HTML.
- * Handles concurrency limits and ensures proper cleanup of browser resources.
- * @param url - URL to render
- * @param config - Render configuration with timeout and concurrency limits
- * @param userAgent - Optional user agent string (defaults to Chrome)
- * @param origin - Optional origin header for host-based routing
- * @returns Promise resolving to rendered HTML string
- * @throws Error if concurrency limit reached or rendering fails
+ * Renders a URL using Playwright with a pooled browser context.
+ * Per-request userAgent and Origin are set via route interception on the page.
  */
 export const render = async (
     url: string,
@@ -179,85 +144,52 @@ export const render = async (
     userAgent: string | null = null,
     origin: string | null = null
 ): Promise<string> => {
-    // Check and increment concurrency counter
-    // Note: In Node.js single-threaded event loop, this is safe as JavaScript is single-threaded.
-    // However, for clarity and future-proofing, consider using a semaphore library if worker threads are introduced.
-    const currentRequests = activeRequests
-    if (currentRequests >= config.maxConcurrency) {
-        logger.warn(`Max concurrency limit reached (${currentRequests}/${config.maxConcurrency}) for ${url}`)
-        throw new Error('Max concurrency limit reached')
-    }
-    activeRequests++
-
     let context: BrowserContext | null = null
     let page: Page | null = null
     let cleanupCompleted = false
 
     try {
-        // Ensure browser is launched
-        const browserInstance = await launchBrowser()
+        await launchBrowser()
 
-        // Prepare extra HTTP headers
-        const extraHeaders: Record<string, string> = {}
-        if (origin) {
-            extraHeaders['Origin'] = origin
-        }
-
-        // Create new context for isolation
-        context = await browserInstance.newContext({
-            userAgent:
-                userAgent ||
-                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            viewport: { width: DEFAULT_VIEWPORT_WIDTH, height: DEFAULT_VIEWPORT_HEIGHT },
-            // Disable file system access for security
-            permissions: [],
-            // Block dangerous features
-            javaScriptEnabled: true,
-            acceptDownloads: false,
-            // Set extra headers including Origin for host-based routing
-            extraHTTPHeaders: extraHeaders
-        })
+        // Acquire a pre-warmed context from the pool
+        context = await acquire()
 
         page = await context.newPage()
 
-        // Block unnecessary resources for performance and set headers for host-based routing
+        // Set per-request userAgent and Origin via route interception
         await page.route('**/*', route => {
             const request = route.request()
             const resourceType = request.resourceType()
 
-            // Only allow document, script, xhr, fetch
             const allowedTypes = ['document', 'script', 'xhr', 'fetch']
             if (!allowedTypes.includes(resourceType)) {
                 route.abort()
             } else {
-                // Set Origin header and internal render header for host-based routing in Express
                 const headers: Record<string, string> = { ...request.headers() }
                 if (origin) {
                     headers['Origin'] = origin
                 }
-                headers['X-RenderX-Internal'] = 'true' // Mark as internal render request
+                headers['X-RenderX-Internal'] = 'true'
+
+                // Override user agent per request
+                if (userAgent) {
+                    headers['User-Agent'] = userAgent
+                }
+
                 route.continue({ headers })
             }
         })
 
-        // Navigate and wait for readiness
         await waitForReadiness(page, url, config, false)
 
-        // Extract rendered HTML
-        let html = await page.content()
-
-        // Optimize HTML for SEO and social sharing (skip if strategy is 'ssr' as it breaks SSR websites)
-        if (config.strategy !== 'ssr') {
-            html = optimizeHtmlForSEO(html, config.htmlOptimizerOptions)
-        }
-
+        const html = await page.content()
         return html
     } catch (err) {
         const error = err as Error
         logger.error(`Render error for ${url}:`, error.message)
         throw err
     } finally {
-        // Clean up with timeout protection to prevent hanging
+        // Close page but release context back to pool (not close)
         const cleanupPromise = (async () => {
             if (page) {
                 try {
@@ -268,25 +200,23 @@ export const render = async (
             }
             if (context) {
                 try {
-                    await context.close()
+                    await release(context)
                 } catch (err) {
-                    logger.error('Error closing context:', err)
+                    logger.error('Error releasing context:', err)
                 }
             }
             cleanupCompleted = true
         })()
 
-        // Add timeout to cleanup to prevent hanging
         const timeoutPromise = new Promise<void>(resolve => {
             setTimeout(() => {
                 if (!cleanupCompleted) {
                     logger.warn('Browser cleanup timeout - forcing cleanup')
-                    // Force cleanup if timeout wins
                     if (page) {
                         page.close().catch(() => {})
                     }
                     if (context) {
-                        context.close().catch(() => {})
+                        release(context).catch(() => {})
                     }
                 }
                 resolve()
@@ -294,33 +224,37 @@ export const render = async (
         })
 
         await Promise.race([cleanupPromise, timeoutPromise])
-        activeRequests--
     }
 }
 
-/**
- * Gets the current number of active render requests.
- * @returns Current active request count
- */
-export const getActiveRequests = (): number => {
-    return activeRequests
+export const isBrowserReady = (): boolean => {
+    return browser !== null && browser.isConnected()
 }
 
 /**
- * Pre-launches browser on startup to avoid cold start delays.
- * This is called during server initialization.
+ * Pre-launches browser and initializes the context pool on startup.
+ * Pool size matches parallelRenders from global config.
  */
 export const preLaunchBrowser = async (): Promise<void> => {
     try {
-        await launchBrowser()
-    } catch (err) {
-        // Don't fail server startup if browser launch fails
-        // It will be retried on first render request
+        const browserInstance = await launchBrowser()
+        const config = getConfig()
+
+        // Init context pool and render queue with same parallelRenders limit
+        await initPool(browserInstance, config.parallelRenders)
+        initRenderQueue(config.parallelRenders)
+
+        browserInstance.on('disconnected', () => {
+            logger.warn('Browser disconnected, pool will be rebuilt on next launch')
+        })
+    } catch {
+        // Don't fail server startup — browser will be retried on first render
     }
 }
 
-// Graceful shutdown
+// Graceful shutdown: destroy pool then close browser
 process.on('SIGTERM', async () => {
+    await destroyPool()
     if (browser) {
         await browser.close()
     }
@@ -328,6 +262,7 @@ process.on('SIGTERM', async () => {
 })
 
 process.on('SIGINT', async () => {
+    await destroyPool()
     if (browser) {
         await browser.close()
     }

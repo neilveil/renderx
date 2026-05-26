@@ -1,27 +1,20 @@
 import { createHash } from 'crypto'
 import fs from 'fs/promises'
 import path from 'path'
+import { getConfig } from './config'
 import { logger } from './logger'
 
-// Constants
 const DEFAULT_CACHE_TTL_SECONDS = 3600
 const CACHE_CLEANUP_BATCH_SIZE = 100
 
 const getCacheDir = (): string => {
-    // Use environment variable if set, otherwise default to .cache
     const cacheDir = process.env.CACHE_DIR || '.cache'
-    // If relative path, resolve relative to process.cwd()
     return path.isAbsolute(cacheDir) ? cacheDir : path.join(process.cwd(), cacheDir)
 }
 
-// Cache directory initialization state
 let cacheDirInitialized = false
 let cacheDirPromise: Promise<void> | null = null
 
-/**
- * Ensures cache directory exists, using a promise-based lock to prevent race conditions.
- * @returns Promise that resolves when directory is ready
- */
 const ensureCacheDir = async (): Promise<void> => {
     if (cacheDirInitialized) return
 
@@ -35,50 +28,45 @@ const ensureCacheDir = async (): Promise<void> => {
             await fs.mkdir(cacheDir, { recursive: true })
             cacheDirInitialized = true
         } catch (err) {
-            const error = err as Error & { code?: string }
             logger.error('Failed to create cache directory:', err)
-            // Reset promise on error so it can be retried
             cacheDirPromise = null
-            throw error
+            throw err
         }
     })()
 
     return cacheDirPromise
 }
 
-// Initialize cache directory on module load (non-blocking)
-ensureCacheDir().catch(() => {
-    // Error already logged in ensureCacheDir
-})
+ensureCacheDir().catch(() => {})
 
-// Start automatic cleanup on module load
 let cleanupInterval: NodeJS.Timeout | null = null
 
-export const startCleanupInterval = async (intervalMinutes: number = 60, clearOnStartup: boolean = true): Promise<void> => {
-    // Clear existing interval if any
+export const startCleanupInterval = async (
+    intervalMinutes: number = 60,
+    clearOnStartup: boolean = true
+): Promise<void> => {
     if (cleanupInterval) {
         clearInterval(cleanupInterval)
     }
 
-    // Ensure cache directory exists first
     await ensureCacheDir()
 
-    // Clear cache on startup if configured (default: true for fresh start)
     if (clearOnStartup) {
         try {
             const cacheDir = getCacheDir()
             const files = await fs.readdir(cacheDir).catch(() => [])
-            const cacheFiles = files.filter((f: string) => f.endsWith('.html') || f.endsWith('.meta'))
+            const cacheFiles = files.filter((fileName: string) => fileName.endsWith('.html') || fileName.endsWith('.meta'))
 
             if (cacheFiles.length > 0) {
-                await Promise.all(cacheFiles.map((file: string) => fs.unlink(path.join(cacheDir, file)).catch(() => {})))
+                await Promise.all(
+                    cacheFiles.map((file: string) => fs.unlink(path.join(cacheDir, file)).catch(() => {}))
+                )
                 logger.info(`Cache directory cleared on startup: ${cacheFiles.length} files removed`)
             }
         } catch (err) {
             logger.error('Error clearing cache on startup:', err)
         }
     } else {
-        // Only clear expired entries on startup
         try {
             await cache.cleanup()
         } catch (err) {
@@ -86,10 +74,8 @@ export const startCleanupInterval = async (intervalMinutes: number = 60, clearOn
         }
     }
 
-    // Convert minutes to milliseconds for setInterval
     const intervalMs = intervalMinutes * 60 * 1000
 
-    // Set up periodic cleanup for expired entries
     cleanupInterval = setInterval(() => {
         cache.cleanup().catch(err => {
             logger.error('Periodic cache cleanup error:', err)
@@ -108,7 +94,6 @@ export const stopCleanupInterval = (): void => {
 }
 
 const getCacheKey = (url: string, deviceType: string = 'desktop'): string => {
-    // Use SHA-256 for cache keys (more future-proof than MD5)
     const hash = createHash('sha256').update(`${deviceType}:${url}`).digest('hex')
     return path.join(getCacheDir(), `${hash}.html`)
 }
@@ -117,18 +102,17 @@ const getMetadataPath = (cacheKey: string): string => {
     return `${cacheKey}.meta`
 }
 
-interface CacheMetadata {
+type CacheMetadata = {
     expiresAt: number
+    createdAt: number
     url: string
     deviceType: string
 }
 
-const isExpired = (metadata: CacheMetadata): boolean => {
-    return Date.now() > metadata.expiresAt
-}
+type CacheGetResult = { html: string; stale: boolean }
 
-export interface CacheInterface {
-    get(url: string, deviceType?: string): Promise<string | null>
+export type CacheInterface = {
+    get(url: string, deviceType?: string, cacheTtl?: number): Promise<CacheGetResult | null>
     set(url: string, html: string, deviceType?: string, cacheTtl?: number): Promise<boolean>
     invalidate(url: string, deviceType?: string): Promise<boolean>
     clear(): Promise<boolean>
@@ -136,57 +120,63 @@ export interface CacheInterface {
 }
 
 const cache: CacheInterface = {
-    async get(url: string, deviceType: string = 'desktop'): Promise<string | null> {
+    async get(
+        url: string,
+        deviceType: string = 'desktop',
+        cacheTtl: number = DEFAULT_CACHE_TTL_SECONDS
+    ): Promise<CacheGetResult | null> {
         try {
-            // Ensure cache directory exists
             await ensureCacheDir()
 
             const cacheKey = getCacheKey(url, deviceType)
             const metadataPath = getMetadataPath(cacheKey)
 
-            // Check if metadata exists
             let metadata: CacheMetadata
             try {
                 const metadataContent = await fs.readFile(metadataPath, 'utf-8')
                 metadata = JSON.parse(metadataContent)
             } catch (err) {
                 const error = err as Error & { code?: string }
-                // File doesn't exist - cache miss (not an error)
-                if (error.code === 'ENOENT') {
-                    return null
-                }
-                // Other errors (permission, corruption, etc.) - log but return null
+                if (error.code === 'ENOENT') return null
                 logger.warn('Cache metadata read error (treating as cache miss):', error.message)
                 return null
             }
 
-            // Check if expired
-            if (isExpired(metadata)) {
-                // Clean up expired files
+            // Derive createdAt for legacy entries that lack it
+            const createdAt = metadata.createdAt ?? metadata.expiresAt - cacheTtl * 1000
+
+            // 2x TTL hard expiry: don't serve anything older than 2 full cycles
+            const age = Date.now() - createdAt
+            if (age > 2 * cacheTtl * 1000) {
                 try {
-                    await Promise.all([fs.unlink(cacheKey).catch(() => {}), fs.unlink(metadataPath).catch(() => {})])
+                    await Promise.all([
+                        fs.unlink(cacheKey).catch(() => {}),
+                        fs.unlink(metadataPath).catch(() => {})
+                    ])
                 } catch {
-                    // Ignore errors if files don't exist
+                    // ignore
                 }
                 return null
             }
 
-            // Read cached HTML
+            let html: string
             try {
-                const html = await fs.readFile(cacheKey, 'utf-8')
-                return html
+                html = await fs.readFile(cacheKey, 'utf-8')
             } catch (err) {
                 const error = err as Error & { code?: string }
                 if (error.code === 'ENOENT') {
-                    // HTML file missing but metadata exists - inconsistent state, clean up
                     logger.warn('Cache HTML file missing, cleaning up metadata')
                     await fs.unlink(metadataPath).catch(() => {})
                     return null
                 }
-                // Other errors (permission, corruption, etc.)
                 logger.error('Cache HTML read error:', err)
                 return null
             }
+
+            // Stale threshold: half of cacheTtl
+            const stale = age >= (cacheTtl * 1000) / 2
+
+            return { html, stale }
         } catch (err) {
             logger.error('Cache get error:', err)
             return null
@@ -205,14 +195,14 @@ const cache: CacheInterface = {
             const cacheKey = getCacheKey(url, deviceType)
             const metadataPath = getMetadataPath(cacheKey)
 
-            const expiresAt = Date.now() + cacheTtl * 1000
+            const now = Date.now()
             const metadata: CacheMetadata = {
-                expiresAt,
+                expiresAt: now + cacheTtl * 1000,
+                createdAt: now,
                 url,
                 deviceType
             }
 
-            // Write HTML and metadata atomically
             await Promise.all([
                 fs.writeFile(cacheKey, html, 'utf-8'),
                 fs.writeFile(metadataPath, JSON.stringify(metadata), 'utf-8')
@@ -243,9 +233,11 @@ const cache: CacheInterface = {
         try {
             const cacheDir = getCacheDir()
             const files = await fs.readdir(cacheDir)
-            const cacheFiles = files.filter((f: string) => f.endsWith('.html') || f.endsWith('.meta'))
+            const cacheFiles = files.filter((fileName: string) => fileName.endsWith('.html') || fileName.endsWith('.meta'))
 
-            await Promise.all(cacheFiles.map((file: string) => fs.unlink(path.join(cacheDir, file)).catch(() => {})))
+            await Promise.all(
+                cacheFiles.map((file: string) => fs.unlink(path.join(cacheDir, file)).catch(() => {}))
+            )
 
             logger.info(`Cache cleared: ${cacheFiles.length} files removed`)
             return true
@@ -263,18 +255,23 @@ const cache: CacheInterface = {
             await ensureCacheDir()
             const cacheDir = getCacheDir()
             const files = await fs.readdir(cacheDir)
-            const metaFiles = files.filter((f: string) => f.endsWith('.meta'))
+            const metaFiles = files.filter((fileName: string) => fileName.endsWith('.meta'))
 
-            // Process metadata files in batches for better performance
+            // Read cacheTtl from global config
+            const globalCfg = getConfig()
+            const cacheTtlSeconds = (globalCfg.cacheCleanupInterval || 60) * 60
+
             const processFile = async (metaFile: string): Promise<void> => {
                 try {
                     const metaPath = path.join(cacheDir, metaFile)
                     const metaContent = await fs.readFile(metaPath, 'utf-8')
                     const metadata: CacheMetadata = JSON.parse(metaContent)
 
-                    // Check if expired
-                    if (isExpired(metadata)) {
-                        // Remove both metadata and HTML files
+                    const createdAt = metadata.createdAt ?? metadata.expiresAt - cacheTtlSeconds * 1000
+                    const age = Date.now() - createdAt
+
+                    // Remove entries older than 2x TTL
+                    if (age > 2 * cacheTtlSeconds * 1000) {
                         const htmlFile = metaFile.replace('.meta', '')
                         const htmlPath = path.join(cacheDir, htmlFile)
 
@@ -282,14 +279,13 @@ const cache: CacheInterface = {
 
                         removed++
                     }
-                } catch (err) {
+                } catch {
                     errors++
                 }
             }
 
-            // Process in batches to avoid overwhelming the system
-            for (let i = 0; i < metaFiles.length; i += CACHE_CLEANUP_BATCH_SIZE) {
-                const batch = metaFiles.slice(i, i + CACHE_CLEANUP_BATCH_SIZE)
+            for (let index = 0; index < metaFiles.length; index += CACHE_CLEANUP_BATCH_SIZE) {
+                const batch = metaFiles.slice(index, index + CACHE_CLEANUP_BATCH_SIZE)
                 await Promise.all(batch.map(processFile))
             }
 

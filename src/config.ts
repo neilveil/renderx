@@ -5,57 +5,17 @@ import { HtmlOptimizerOptions } from './htmlOptimizer'
 
 dotenv.config()
 
-export type RenderingStrategy = 'smart-ssr' | 'ssr' | 'csr'
-
-// Default bots list including AI bots and common crawlers
-const DEFAULT_BOTS = [
-    // Search engines
-    'Googlebot',
-    'bingbot',
-    'Slurp',
-    'DuckDuckBot',
-    'Baiduspider',
-    'YandexBot',
-    'Applebot',
-    // Social media bots
-    'facebookexternalhit',
-    'Twitterbot',
-    'LinkedInBot',
-    'Pinterestbot',
-    'Slack',
-    'WhatsApp',
-    'TelegramBot',
-    'vkShare',
-    // AI bots
-    'GPTBot',
-    'ChatGPT-User',
-    'Google-Extended',
-    'ClaudeBot',
-    'Claude-Web',
-    'GrokBot',
-    'meta-externalagent',
-    'meta-externalfetcher',
-    'PerplexityBot',
-    'Amazonbot',
-    'CCBot',
-    'ia_archiver',
-    'YouBot',
-    'Neevabot',
-    // Other
-    'headlessbot'
-]
+export type LogFormat = 'text' | 'json'
 
 export interface HostConfig {
     source: string
     host: string
-    isActive?: boolean // Optional, defaults to true
-    // Per-host overrides (optional)
+    isActive?: boolean
     timeoutMs?: number
     parallelRenders?: number
-    bots?: string[]
-    strategy?: RenderingStrategy
-    rootSelector?: string // Optional root selector for SPA detection (default: '#root')
-    htmlOptimizerOptions?: HtmlOptimizerOptions // Optional HTML optimizer configuration
+    ssr?: boolean
+    rootSelector?: string
+    htmlOptimizerOptions?: HtmlOptimizerOptions
 }
 
 export type LogLevel = 'none' | 'ssr' | 'all'
@@ -63,17 +23,15 @@ export type LogLevel = 'none' | 'ssr' | 'all'
 export interface GlobalConfig {
     port: number
     parallelRenders: number
-    bots: string[]
-    cacheCleanupInterval?: number // Cleanup interval in minutes (default: 60 minutes)
-    strategy: RenderingStrategy
+    cacheCleanupInterval?: number
+    ssr: boolean
     hosts: HostConfig[]
     logs?: LogLevel
-    rootSelector?: string // Optional root selector for SPA detection (default: '#root')
-    clearCacheOnStartup?: boolean // Whether to clear all cache on startup (default: true)
-    htmlOptimizerOptions?: HtmlOptimizerOptions // Optional HTML optimizer configuration
-    // Legacy env var support
+    rootSelector?: string
+    clearCacheOnStartup?: boolean
+    htmlOptimizerOptions?: HtmlOptimizerOptions
     timeoutMs?: number
-    maxConcurrency?: number
+    logFormat?: LogFormat
 }
 
 let configData: GlobalConfig | null = null
@@ -82,34 +40,57 @@ const loadConfig = (): GlobalConfig => {
     if (configData) return configData
 
     const configPath = path.join(process.cwd(), 'config.json')
-    let fileConfig: Partial<GlobalConfig> = {}
+    let fileConfig: Partial<GlobalConfig> & {
+        bots?: string[]
+        maxConcurrency?: number
+        strategy?: string
+    } = {}
 
-    // Try to load config.json
     if (fs.existsSync(configPath)) {
         try {
             const fileContent = fs.readFileSync(configPath, 'utf-8')
             fileConfig = JSON.parse(fileContent)
         } catch (err) {
-            // Always log config errors (before logger is available)
             console.error('Failed to load config.json:', err)
         }
     }
 
-    // Merge with environment variables (env vars take precedence)
+    // Backward compat: warn about removed fields
+    if (fileConfig.strategy) {
+        console.warn('[DEPRECATED] "strategy" is removed in v2. Use "ssr": true/false instead.')
+    }
+    if (fileConfig.bots) {
+        console.warn('[DEPRECATED] "bots" config is removed in v2. Bot detection has been removed.')
+    }
+    if (fileConfig.maxConcurrency) {
+        console.warn('[DEPRECATED] "maxConcurrency" is removed in v2. Use "parallelRenders" instead.')
+    }
+    if (process.env.MAX_CONCURRENCY) {
+        console.warn('[DEPRECATED] MAX_CONCURRENCY env var is removed in v2. Use PARALLEL_RENDERS instead.')
+    }
+
+    // SSR is on by default. Explicit false in config or env var SSR=false disables it.
+    const ssrEnv = process.env.SSR
+    const ssrEnabled = ssrEnv !== undefined ? ssrEnv !== 'false' : (fileConfig.ssr ?? true)
+
+    const defaultLogFormat: LogFormat = process.env.NODE_ENV === 'development' ? 'text' : 'json'
+    const logFormat = (process.env.LOG_FORMAT || fileConfig.logFormat || defaultLogFormat) as LogFormat
+
     configData = {
         port: parseInt(process.env.PORT || fileConfig.port?.toString() || '8080', 10),
-        parallelRenders: parseInt(process.env.MAX_CONCURRENCY || fileConfig.parallelRenders?.toString() || '10', 10),
-        bots: fileConfig.bots && fileConfig.bots.length > 0 ? fileConfig.bots : DEFAULT_BOTS,
+        parallelRenders: parseInt(
+            process.env.PARALLEL_RENDERS || process.env.MAX_CONCURRENCY || fileConfig.parallelRenders?.toString() || '10',
+            10
+        ),
         cacheCleanupInterval: parseInt(
             process.env.CACHE_CLEANUP_INTERVAL || fileConfig.cacheCleanupInterval?.toString() || '60',
             10
-        ), // Default: 60 minutes
-        strategy: (process.env.STRATEGY || fileConfig.strategy || 'smart-ssr') as RenderingStrategy,
+        ),
+        ssr: ssrEnabled,
         hosts: fileConfig.hosts || [],
         logs: (process.env.LOGS || fileConfig.logs || 'ssr') as LogLevel,
-        // Legacy support
         timeoutMs: parseInt(process.env.TIMEOUT_MS || '10000', 10),
-        maxConcurrency: parseInt(process.env.MAX_CONCURRENCY || '10', 10)
+        logFormat
     }
 
     return configData
@@ -119,78 +100,62 @@ export const getConfig = (): GlobalConfig => {
     return loadConfig()
 }
 
-/**
- * Checks if a hostname matches a glob pattern
- * @param pattern - Glob pattern (e.g., "*", "*.my-app.com")
- * @param hostname - Hostname to match against
- * @returns true if hostname matches the pattern, false otherwise
- */
 const matchesGlobPattern = (pattern: string, hostname: string): boolean => {
-    // Exact match
-    if (pattern === hostname) {
-        return true
-    }
+    if (pattern === hostname) return true
+    if (pattern === '*') return true
 
-    // Wildcard "*" matches everything
-    if (pattern === '*') {
-        return true
-    }
-
-    // Convert glob pattern to regex
-    // Use a temporary placeholder for * to avoid escaping it
     const placeholder = '__WILDCARD_PLACEHOLDER__'
     const escapedPattern = pattern
-        .replace(/\*/g, placeholder) // Replace * with placeholder
-        .replace(/[.+?^${}()|[\]\\]/g, '\\$&') // Escape special regex chars
-        .replace(new RegExp(placeholder.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '.*') // Replace placeholder with .*
+        .replace(/\*/g, placeholder)
+        .replace(/[.+?^${}()|[\]\\]/g, '\\$&')
+        .replace(new RegExp(placeholder.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '.*')
 
-    // Create regex: ^escapedPattern$ (anchored at start and end)
-    const regexPattern = `^${escapedPattern}$`
-    const regex = new RegExp(regexPattern)
-
+    const regex = new RegExp(`^${escapedPattern}$`)
     return regex.test(hostname)
 }
 
 export const getHostConfig = (hostname: string): HostConfig | null => {
     const config = loadConfig()
 
-    // First, try exact matches (for backward compatibility and priority)
-    const exactMatch = config.hosts.find(h => h.host === hostname && (h.isActive ?? true))
-    if (exactMatch) {
-        return exactMatch
-    }
+    const exactMatch = config.hosts.find(host => host.host === hostname && (host.isActive ?? true))
+    if (exactMatch) return exactMatch
 
-    // Then, try glob pattern matches
-    const globMatch = config.hosts.find(h => matchesGlobPattern(h.host, hostname) && (h.isActive ?? true))
-
+    const globMatch = config.hosts.find(host => matchesGlobPattern(host.host, hostname) && (host.isActive ?? true))
     return globMatch || null
 }
 
-export const getEffectiveConfig = (hostname?: string) => {
+export const getEffectiveConfig = (hostname?: string): {
+    port: number
+    timeoutMs: number
+    cacheTtl: number
+    parallelRenders: number
+    hostsDir: string
+    source: string | null
+    logs: LogLevel
+    ssr: boolean
+    rootSelector: string | undefined
+    clearCacheOnStartup: boolean
+    htmlOptimizerOptions: HtmlOptimizerOptions | undefined
+    logFormat: LogFormat
+} => {
     const global = loadConfig()
     const host = hostname ? getHostConfig(hostname) : null
-
-    // Determine botOnly based on strategy
-    const renderingStrategy = (host?.strategy ?? global.strategy ?? 'smart-ssr') as RenderingStrategy
-    const botOnly = renderingStrategy === 'smart-ssr' || renderingStrategy === 'csr'
 
     return {
         port: global.port,
         timeoutMs: host?.timeoutMs ?? global.timeoutMs ?? 10000,
-        cacheTtl: (global.cacheCleanupInterval || 60) * 60, // Convert minutes to seconds
-        botOnly,
-        maxConcurrency: host?.parallelRenders ?? global.parallelRenders ?? global.maxConcurrency ?? 10,
-        bots: host?.bots ?? global.bots ?? [],
+        cacheTtl: (global.cacheCleanupInterval || 60) * 60,
+        parallelRenders: host?.parallelRenders ?? global.parallelRenders ?? 10,
         hostsDir: './hosts',
         source: host?.source ?? null,
         logs: global.logs ?? 'ssr',
-        renderingStrategy,
+        ssr: host?.ssr ?? global.ssr ?? true,
         rootSelector: host?.rootSelector ?? global.rootSelector,
         clearCacheOnStartup: global.clearCacheOnStartup ?? true,
-        htmlOptimizerOptions: host?.htmlOptimizerOptions ?? global.htmlOptimizerOptions
+        htmlOptimizerOptions: host?.htmlOptimizerOptions ?? global.htmlOptimizerOptions,
+        logFormat: global.logFormat ?? (process.env.NODE_ENV === 'development' ? 'text' : 'json')
     }
 }
 
-// Default export for backward compatibility
 const config = getEffectiveConfig()
 export default config

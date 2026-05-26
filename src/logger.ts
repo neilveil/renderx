@@ -1,80 +1,100 @@
-import { getConfig, LogLevel } from './config'
+import { getConfig, LogFormat, LogLevel } from './config'
 
 let logsLevel: LogLevel | null = null
+let logFormat: LogFormat | null = null
 let configInitialized = false
 
-/**
- * Lazy initialization of logs setting to avoid circular dependencies.
- * The config is loaded on first access, ensuring it's fully initialized.
- */
 const getLogsLevel = (): LogLevel => {
     if (logsLevel === null || !configInitialized) {
         try {
             const config = getConfig()
             logsLevel = config.logs ?? 'ssr'
+            logFormat = config.logFormat ?? (process.env.NODE_ENV === 'development' ? 'text' : 'json')
             configInitialized = true
-        } catch (err) {
-            // If config not ready, default to 'ssr'
+        } catch {
             logsLevel = 'ssr'
+            logFormat = 'text'
             configInitialized = false
         }
     }
     return logsLevel
 }
 
-/**
- * Checks if general logging is enabled (logs !== 'none')
- */
+const getLogFormat = (): LogFormat => {
+    if (logFormat === null) {
+        getLogsLevel()
+    }
+    return logFormat ?? 'text'
+}
+
 const isLoggingEnabled = (): boolean => {
     return getLogsLevel() !== 'none'
 }
 
-/**
- * Logger utility with configurable log levels.
- * Errors and warnings are always logged, while info/debug/log respect logs setting.
- */
+const formatJsonLog = (level: string, args: unknown[]): string => {
+    const message = args
+        .map(arg => {
+            if (arg instanceof Error) return arg.message
+            if (typeof arg === 'string') return arg
+            return JSON.stringify(arg)
+        })
+        .join(' ')
+
+    return JSON.stringify({ ts: new Date().toISOString(), level, msg: message })
+}
+
 export const logger = {
-    /**
-     * Logs a message if logging is enabled (logs !== 'none')
-     */
     log: (...args: unknown[]): void => {
         if (isLoggingEnabled()) {
-            console.log(...args)
+            if (getLogFormat() === 'json') {
+                console.log(formatJsonLog('info', args))
+            } else {
+                console.log(...args)
+            }
         }
     },
-    /**
-     * Logs an error message (always logged regardless of logs setting)
-     */
-    error: (...args: any[]): void => {
-        // Always log errors
-        console.error(...args)
+
+    error: (...args: unknown[]): void => {
+        if (getLogFormat() === 'json') {
+            console.error(formatJsonLog('error', args))
+        } else {
+            console.error(...args)
+        }
     },
-    /**
-     * Logs a warning message (always logged regardless of logs setting)
-     */
-    warn: (...args: any[]): void => {
-        // Always log warnings
-        console.warn(...args)
+
+    warn: (...args: unknown[]): void => {
+        if (getLogFormat() === 'json') {
+            console.warn(formatJsonLog('warn', args))
+        } else {
+            console.warn(...args)
+        }
     },
-    /**
-     * Logs an info message if logging is enabled (logs !== 'none')
-     */
-    info: (...args: any[]): void => {
+
+    info: (...args: unknown[]): void => {
         if (isLoggingEnabled()) {
-            console.log(...args)
+            if (getLogFormat() === 'json') {
+                // If the first arg is already a JSON string (from middleware), pass through
+                if (args.length === 1 && typeof args[0] === 'string' && args[0].startsWith('{')) {
+                    console.log(args[0])
+                } else {
+                    console.log(formatJsonLog('info', args))
+                }
+            } else {
+                console.log(...args)
+            }
         }
     },
-    /**
-     * Logs a debug message if logging is enabled (logs !== 'none')
-     */
-    debug: (...args: any[]): void => {
+
+    debug: (...args: unknown[]): void => {
         if (isLoggingEnabled()) {
-            console.log('[DEBUG]', ...args)
+            if (getLogFormat() === 'json') {
+                console.log(formatJsonLog('debug', args))
+            } else {
+                console.log('[DEBUG]', ...args)
+            }
         }
     },
-    /**
-     * Gets the current logs level
-     */
+
     getLogsLevel: (): LogLevel => {
         return getLogsLevel()
     }

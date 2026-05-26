@@ -10,16 +10,20 @@ build-demo-app:
 	@rm -rf hosts/demo-app
 	@mv demo-app/dist hosts/demo-app
 
-test-csr:
-	@echo "Testing CSR /..."
-	@curl http://localhost:8080 -H "Origin: https://demo-app.com"
-	@echo "Testing CSR /posts..."
-	@curl http://localhost:8080/posts -H "Origin: https://demo-app.com"
-
 test-ssr:
-	@echo "Testing SSR /..."
-	@curl http://localhost:8080 -H "Origin: https://demo-app.com" -H "User-Agent: Googlebot"
-	@echo "Testing SSR /posts..."
-	@curl http://localhost:8080/posts -H "Origin: https://demo-app.com" -H "User-Agent: Googlebot"
+	@echo "Testing SSR..."
+	@curl -s http://localhost:8080 -H "Origin: https://demo-app.com" | grep -q "<title>" && echo "PASS" || echo "FAIL"
 
-test-all-routes: test-csr test-ssr
+test-cache:
+	@echo "Testing cache..."
+	@curl -s http://localhost:8080 -H "Origin: https://demo-app.com" > /dev/null
+	@curl -s -o /dev/null -w "Cache response: %{time_total}s\n" http://localhost:8080 -H "Origin: https://demo-app.com"
+
+test-static:
+	@echo "Testing static..."
+	@curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/vite.svg -H "Origin: https://demo-app.com"
+
+test-health:
+	@curl -s http://localhost:8080/health | python3 -m json.tool
+
+test-all: test-ssr test-cache test-static test-health

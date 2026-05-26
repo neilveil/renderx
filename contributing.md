@@ -20,19 +20,37 @@ RenderX is a TypeScript service that uses Playwright to render client-side appli
     - Waits for page readiness
     - Optimizes HTML for SEO
 
-3. **Cache** (`src/cache.ts`)
+3. **Context Pool** (`src/contextPool.ts`)
 
-    - File-based caching system
-    - Stores rendered HTML with metadata
-    - Automatic cleanup of expired entries
+    - Pre-warmed browser contexts for lower latency
+    - Recycles contexts after 50 renders or 10 minutes
+    - Resets pages to `about:blank` on release
 
-4. **Config** (`src/config.ts`)
+4. **Render Queue** (`src/renderQueue.ts`)
+
+    - Priority queue (`high` for real requests, `low` for background refreshes)
+    - Prevents rejection at capacity — requests wait in queue
+    - Returns 503 only when queue overflows (3x `parallelRenders`)
+
+5. **Cache** (`src/cache.ts`)
+
+    - File-based caching with stale-while-revalidate
+    - Stores rendered HTML with metadata (including `createdAt`)
+    - Stale entries served instantly with background refresh
+    - Automatic cleanup of entries older than 2x TTL
+
+6. **Config** (`src/config.ts`)
 
     - Loads `config.json`
     - Supports environment variable overrides
     - Merges global and per-host settings
 
-5. **HTML Optimizer** (`src/htmlOptimizer.ts`)
+7. **Logger** (`src/logger.ts`)
+
+    - Configurable format: `text` (human-readable) or `json` (structured)
+    - Respects `logs` level setting
+
+8. **HTML Optimizer** (`src/htmlOptimizer.ts`)
     - Removes scripts/styles for SEO
     - Minifies HTML
     - Keeps essential content
@@ -43,39 +61,36 @@ RenderX is a TypeScript service that uses Playwright to render client-side appli
 1. Request arrives with Origin header
 2. Parse hostname from Origin
 3. Find matching host config
-4. Check if bot (user agent detection)
-5. Determine rendering strategy:
-   - smart-ssr: Render if bot, static if user
-   - ssr: Always render
-   - csr: Never render
-6. If rendering:
-   - Check cache first
-   - If miss: Render with Playwright
-   - Store in cache
-   - Return HTML
-7. If not rendering:
+4. Check SSR flag:
+   - ssr enabled (default): Check cache → render if miss
+   - ssr disabled: Serve static files
+5. If rendering:
+   - Check cache (fresh/stale/miss)
+   - If fresh hit: return cached HTML
+   - If stale hit: return cached HTML + background refresh
+   - If miss: render with Playwright, cache, return
+6. If not rendering:
    - Serve static files directly
 ```
 
 ### Rendering Process
 
-1. Launch browser context (reused across requests)
+1. Acquire pre-warmed browser context from pool
 2. Create new page
-3. Set `RenderX/1.0` user agent (prevents loops)
-4. Set Origin header
+3. Set per-request `RenderX/1.0` user agent via route interception (prevents loops)
+4. Set Origin header via route interception
 5. Block non-essential resources (images, fonts)
 6. Navigate to local URL (`http://localhost:{port}{path}`)
 7. Wait for readiness (networkidle, selector, or load)
 8. Extract HTML
-9. Optimize HTML
-10. Close page, return HTML
+9. Close page, release context back to pool
 
 ### Caching
 
 -   **Storage**: Files in `.cache/` directory
--   **Key**: MD5 hash of `{device}:{url}`
--   **TTL**: Configurable per-host
--   **Cleanup**: Automatic on startup and periodic intervals
+-   **Key**: SHA-256 hash of `{device}:{url}`
+-   **Stale-while-revalidate**: Entries go stale after half the TTL. Stale entries are served instantly, and a background re-render is triggered.
+-   **Cleanup**: Entries older than 2x TTL are purged. Periodic cleanup runs at the configured interval.
 
 ## Development Setup
 
@@ -115,8 +130,10 @@ src/
 ├── index.ts          # Express server & routing
 ├── config.ts         # Configuration loader
 ├── renderer.ts       # Playwright renderer
-├── cache.ts          # File-based cache
-├── logger.ts         # Logging utility
+├── contextPool.ts    # Browser context pool
+├── renderQueue.ts    # Priority render queue
+├── cache.ts          # File-based cache (stale-while-revalidate)
+├── logger.ts         # Logging utility (text/JSON)
 └── htmlOptimizer.ts  # HTML SEO optimizer
 ```
 
@@ -140,55 +157,64 @@ Expected response:
 ```json
 {
     "status": "ok",
-    "activeRequests": 0,
-    "maxConcurrency": 3,
+    "activeRenders": 0,
+    "parallelRenders": 10,
+    "queueDepth": 0,
     "hosts": 1
 }
 ```
 
-### 2. Test Static File Serving
+### 2. Test SSR
 
 ```bash
-# Regular user request (should serve static files)
+# Any request to a page route triggers SSR
 curl -H "Origin: https://my-app.com" \
-     http://localhost:8080/
-```
-
-Should return HTML quickly (< 100ms).
-
-### 3. Test Bot Rendering
-
-```bash
-# Bot request (should render)
-curl -H "Origin: https://my-app.com" \
-     -H "User-Agent: Googlebot" \
      http://localhost:8080/
 ```
 
 First request: ~1-2s (rendering)
-Subsequent requests: < 50ms (cached)
+Second request: < 50ms (cached)
 
-### 4. Check Logs
+### 3. Test Cache
+
+```bash
+# First request renders
+curl -H "Origin: https://my-app.com" http://localhost:8080/ > /dev/null
+
+# Second request should be fast (cached)
+curl -s -o /dev/null -w "Cache response: %{time_total}s\n" \
+     -H "Origin: https://my-app.com" http://localhost:8080/
+```
+
+### 4. Test Static
+
+```bash
+# Request to a file path serves static
+curl -H "Origin: https://my-app.com" \
+     http://localhost:8080/vite.svg
+```
+
+### 5. Check Logs
 
 Configure logging level in `config.json`:
 
 ```json
 {
-    "logs": "all"
+    "logs": "all",
+    "logFormat": "text"
 }
 ```
 
 Logging options:
 
 -   `"none"`: No request logs
--   `"ssr"`: Only SSR and SSR-CACHE logs (default)
--   `"all"`: All SSR and CSR logs
+-   `"ssr"`: SSR, SSR-CACHE, and SSR-REFRESH logs (default)
+-   `"all"`: All logs including STATIC
 
-Restart server and check console output for:
+Log format options:
 
--   Render times
--   Cache hits/misses
--   Errors
+-   `"text"`: Human-readable with emojis (default in development)
+-   `"json"`: Structured JSON for log aggregators (default in production)
 
 ## Contribution Guidelines
 
@@ -220,7 +246,6 @@ Use clear, descriptive messages:
 
 -   Bug fixes
 -   Performance improvements
--   New rendering strategies
 -   Better error handling
 -   Documentation improvements
 

@@ -122,9 +122,33 @@ const isSafeUrl = (url: URL): boolean => {
     return true
 }
 
-// Request timeout middleware
+// Known scanner/bot paths that should never trigger SSR
+const SCANNER_PATH_PATTERNS = [
+    /\.php$/i,
+    /\/wp-/i,
+    /\/xmlrpc/i,
+    /\/HNAP/i,
+    /\/cgi-bin/i,
+    /\/\.env/i,
+    /\/\.git/i,
+    /\/\.well-known\/security/i,
+    /\/admin\/?$/i,
+    /\/administrator/i,
+    /\/phpmyadmin/i,
+    /\/config\.(json|yml|yaml|xml|ini|bak)$/i
+]
+
+const isScannerPath = (reqPath: string): boolean => {
+    return SCANNER_PATH_PATTERNS.some(pattern => pattern.test(reqPath))
+}
+
+// Request timeout middleware with AbortController for render cancellation
 app.use((_req: Request, res: Response, next: NextFunction) => {
+    const controller = new AbortController()
+    ;(res as Response & { renderAbortSignal: AbortSignal }).renderAbortSignal = controller.signal
+
     const timeout = setTimeout(() => {
+        controller.abort()
         if (!res.headersSent) {
             sendError(res, 504, 'Request timeout', 'The request took too long to process')
         }
@@ -355,7 +379,8 @@ const renderPage = async (
     cacheKey: string,
     localUrl: string,
     origin: string | undefined,
-    effectiveConfig: ReturnType<typeof getEffectiveConfig>
+    effectiveConfig: ReturnType<typeof getEffectiveConfig>,
+    signal?: AbortSignal
 ): Promise<boolean> => {
     const cached = await cache.get(cacheKey, 'desktop', effectiveConfig.cacheTtl)
 
@@ -364,7 +389,6 @@ const renderPage = async (
         res.setHeader('Content-Type', 'text/html; charset=utf-8')
         res.send(cached.html)
 
-        // Background refresh if stale
         if (cached.stale) {
             triggerBackgroundRefresh(cacheKey, localUrl, origin, 'desktop', effectiveConfig)
         }
@@ -382,7 +406,8 @@ const renderPage = async (
                     rootSelector: effectiveConfig.rootSelector
                 },
                 RENDERX_USER_AGENT,
-                origin
+                origin,
+                signal
             )
         )
 
@@ -395,6 +420,7 @@ const renderPage = async (
         }
     } catch (err) {
         const error = err as Error
+        if (error.message.includes('Render aborted')) return false
         if (error.message.includes('render queue full')) {
             sendError(res, 503, 'Service temporarily unavailable', 'Server at capacity, try again later')
             return true
@@ -445,6 +471,7 @@ app.get('/render', async (req: Request, res: Response) => {
 
         const localUrl = `http://localhost:${globalConfig.port}${parsedUrl.pathname}${parsedUrl.search}`
         const origin = `${parsedUrl.protocol}//${parsedUrl.host}`
+        const signal = (res as Response & { renderAbortSignal?: AbortSignal }).renderAbortSignal
 
         const html = await enqueue('high', () =>
             render(
@@ -455,7 +482,8 @@ app.get('/render', async (req: Request, res: Response) => {
                     rootSelector: effectiveConfig.rootSelector
                 },
                 'RenderX/1.0',
-                origin
+                origin,
+                signal
             )
         )
 
@@ -513,6 +541,11 @@ app.post('/cache/clear', async (_req: Request, res: Response) => {
 
 // Main routing middleware
 app.use(async (req: Request, res: Response, next: () => void) => {
+    // Reject known scanner/bot probes early
+    if (isScannerPath(req.path)) {
+        return sendError(res, 403, 'Forbidden')
+    }
+
     const origin = req.headers.origin
     const userAgent = req.headers['user-agent'] || ''
     const isRenderXRequest = userAgent.toLowerCase().includes('renderx')
@@ -664,8 +697,9 @@ app.use(async (req: Request, res: Response, next: () => void) => {
                     : `${req.protocol}://${originHostname}${req.originalUrl}`
 
                 const localUrl = `http://localhost:${globalConfig.port}${req.originalUrl}`
+                const signal = (res as Response & { renderAbortSignal?: AbortSignal }).renderAbortSignal
 
-                const rendered = await renderPage(res, cacheKey, localUrl, origin || undefined, effectiveConfig)
+                const rendered = await renderPage(res, cacheKey, localUrl, origin || undefined, effectiveConfig, signal)
                 if (rendered) return
             }
             return res.sendFile(indexPath)
@@ -698,8 +732,9 @@ app.use(async (req: Request, res: Response, next: () => void) => {
                 : `${req.protocol}://${originHostname}${req.originalUrl}`
 
             const localUrl = `http://localhost:${globalConfig.port}${req.originalUrl}`
+            const signal = (res as Response & { renderAbortSignal?: AbortSignal }).renderAbortSignal
 
-            const rendered = await renderPage(res, cacheKey, localUrl, origin || undefined, effectiveConfig)
+            const rendered = await renderPage(res, cacheKey, localUrl, origin || undefined, effectiveConfig, signal)
             if (rendered) return
         }
 

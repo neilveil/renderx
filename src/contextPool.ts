@@ -3,16 +3,19 @@ import { logger } from './logger'
 
 const MAX_RENDERS_PER_CONTEXT = 50
 const MAX_AGE_MS = 10 * 60 * 1000
+const STUCK_CONTEXT_TIMEOUT_MS = 60 * 1000
 
 type PoolEntry = {
     context: BrowserContext
     inUse: boolean
     createdAt: number
     renderCount: number
+    acquiredAt: number | null
 }
 
 let pool: PoolEntry[] = []
 let browserRef: Browser | null = null
+let sweepInterval: ReturnType<typeof setInterval> | null = null
 
 /**
  * Creates a single browser context with shared viewport/permission config.
@@ -44,12 +47,13 @@ export const initPool = async (browser: Browser, size: number): Promise<void> =>
     const entries = await Promise.all(
         Array.from({ length: size }, async () => {
             const context = await createContext(browser)
-            return { context, inUse: false, createdAt: Date.now(), renderCount: 0 } satisfies PoolEntry
+            return { context, inUse: false, createdAt: Date.now(), renderCount: 0, acquiredAt: null } satisfies PoolEntry
         })
     )
 
     pool = entries
     initialized = true
+    startSweep()
     logger.info(`Context pool initialized: ${size} contexts`)
 }
 
@@ -79,6 +83,7 @@ export const acquire = async (): Promise<BrowserContext> => {
     }
 
     entry.inUse = true
+    entry.acquiredAt = Date.now()
     entry.renderCount++
     return entry.context
 }
@@ -108,6 +113,42 @@ export const release = async (context: BrowserContext): Promise<void> => {
     }
 
     entry.inUse = false
+    entry.acquiredAt = null
+}
+
+/**
+ * Periodically reclaims contexts stuck in `inUse` for longer than STUCK_CONTEXT_TIMEOUT_MS.
+ * Prevents a single hung render from permanently consuming a pool slot.
+ */
+const startSweep = (): void => {
+    if (sweepInterval) return
+    sweepInterval = setInterval(async () => {
+        const now = Date.now()
+        for (const entry of pool) {
+            if (!entry.inUse || !entry.acquiredAt) continue
+            if (now - entry.acquiredAt < STUCK_CONTEXT_TIMEOUT_MS) continue
+
+            logger.warn(`Force-reclaiming stuck context (held for ${now - entry.acquiredAt}ms)`)
+            try {
+                const pages = entry.context.pages()
+                await Promise.all(pages.map(p => p.close().catch(() => {})))
+            } catch {}
+
+            if (browserRef) {
+                try {
+                    await entry.context.close()
+                    entry.context = await createContext(browserRef)
+                    entry.createdAt = Date.now()
+                    entry.renderCount = 0
+                } catch (err) {
+                    logger.error('Failed to replace stuck context:', err)
+                }
+            }
+
+            entry.inUse = false
+            entry.acquiredAt = null
+        }
+    }, 30000)
 }
 
 /**
@@ -123,6 +164,10 @@ export const destroyPool = async (): Promise<void> => {
             }
         })
     )
+    if (sweepInterval) {
+        clearInterval(sweepInterval)
+        sweepInterval = null
+    }
     pool = []
     browserRef = null
     initialized = false

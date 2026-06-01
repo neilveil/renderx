@@ -69,7 +69,7 @@ const waitForReadiness = async (
 ): Promise<void> => {
     const { timeoutMs } = config
     const startTime = Date.now()
-    const remainingTimeout = (): number => Math.max(1000, timeoutMs - (Date.now() - startTime))
+    const remainingTimeout = (): number => Math.max(0, timeoutMs - (Date.now() - startTime))
 
     try {
         if (!alreadyNavigated) {
@@ -81,20 +81,25 @@ const waitForReadiness = async (
             await page.waitForLoadState('load', { timeout: remainingTimeout() })
         }
 
+        if (remainingTimeout() <= 0) return
+
         try {
             await page.waitForLoadState('networkidle', { timeout: Math.min(15000, remainingTimeout()) })
         } catch {
             // continue
         }
 
+        if (remainingTimeout() <= 0) return
+
         const rootSelector = config.rootSelector || '#root'
         const rootSelectors = [rootSelector, '#app', '[data-reactroot]', 'body > *']
         let rendered = false
 
         for (const selector of rootSelectors) {
+            if (remainingTimeout() <= 0) break
             try {
                 await page.waitForSelector(`${selector} > *`, {
-                    timeout: Math.max(15000, remainingTimeout()),
+                    timeout: Math.min(15000, remainingTimeout()),
                     state: 'attached'
                 })
                 rendered = true
@@ -104,7 +109,7 @@ const waitForReadiness = async (
             }
         }
 
-        if (!rendered) {
+        if (!rendered && remainingTimeout() > 0) {
             try {
                 await page.waitForFunction(
                     `() => {
@@ -112,7 +117,7 @@ const waitForReadiness = async (
                         return root && (root.textContent || root.innerText || '').trim().length > 0;
                     }`,
                     {
-                        timeout: Math.max(10000, remainingTimeout()),
+                        timeout: Math.min(10000, remainingTimeout()),
                         polling: 100
                     }
                 )
@@ -120,6 +125,8 @@ const waitForReadiness = async (
                 // continue
             }
         }
+
+        if (remainingTimeout() <= 0) return
 
         try {
             await page.waitForLoadState('networkidle', { timeout: Math.min(10000, remainingTimeout()) })
@@ -137,26 +144,44 @@ const waitForReadiness = async (
 /**
  * Renders a URL using Playwright with a pooled browser context.
  * Per-request userAgent and Origin are set via route interception on the page.
+ * Accepts an optional AbortSignal to cancel the render externally (e.g. on Express timeout).
  */
 export const render = async (
     url: string,
     config: RenderConfig,
     userAgent: string | null = null,
-    origin: string | null = null
+    origin: string | null = null,
+    signal?: AbortSignal
 ): Promise<string> => {
     let context: BrowserContext | null = null
     let page: Page | null = null
     let cleanupCompleted = false
+    let hardTimeoutId: ReturnType<typeof setTimeout> | null = null
+
+    const forceClosePage = () => {
+        if (page) page.close().catch(() => {})
+    }
+
+    const onAbort = () => forceClosePage()
+    signal?.addEventListener('abort', onAbort, { once: true })
 
     try {
+        if (signal?.aborted) throw new Error('Render aborted')
+
         await launchBrowser()
 
-        // Acquire a pre-warmed context from the pool
         context = await acquire()
 
         page = await context.newPage()
 
-        // Set per-request userAgent and Origin via route interception
+        // Hard timeout: force-close the page if render exceeds 2x the configured timeout.
+        // This prevents renders from running indefinitely even if waitForReadiness stages compound.
+        const hardTimeoutMs = config.timeoutMs * 2
+        hardTimeoutId = setTimeout(() => {
+            logger.warn(`Hard render timeout (${hardTimeoutMs}ms) for ${url}, force-closing page`)
+            forceClosePage()
+        }, hardTimeoutMs)
+
         await page.route('**/*', route => {
             const request = route.request()
             const resourceType = request.resourceType()
@@ -171,7 +196,6 @@ export const render = async (
                 }
                 headers['X-RenderX-Internal'] = 'true'
 
-                // Override user agent per request
                 if (userAgent) {
                     headers['User-Agent'] = userAgent
                 }
@@ -186,10 +210,16 @@ export const render = async (
         return html
     } catch (err) {
         const error = err as Error
+        if (signal?.aborted) {
+            logger.warn(`Render aborted for ${url}`)
+            throw new Error('Render aborted')
+        }
         logger.error(`Render error for ${url}:`, error.message)
         throw err
     } finally {
-        // Close page but release context back to pool (not close)
+        if (hardTimeoutId) clearTimeout(hardTimeoutId)
+        signal?.removeEventListener('abort', onAbort)
+
         const cleanupPromise = (async () => {
             if (page) {
                 try {

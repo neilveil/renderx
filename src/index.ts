@@ -323,6 +323,27 @@ const shouldRender = (
     return ssrEnabled
 }
 
+// Track index.html mtime per source directory to auto-invalidate SSR cache on deploy
+const indexMtimeMap = new Map<string, number>()
+
+const invalidateCacheIfSourceChanged = async (sourcePath: string): Promise<void> => {
+    const indexPath = path.join(sourcePath, 'index.html')
+    try {
+        const stats = fs.statSync(indexPath)
+        const currentMtime = stats.mtimeMs
+        const lastMtime = indexMtimeMap.get(sourcePath)
+
+        if (lastMtime !== undefined && lastMtime !== currentMtime) {
+            logger.info(`Source changed: ${sourcePath}/index.html — clearing SSR cache`)
+            await cache.clear()
+        }
+
+        indexMtimeMap.set(sourcePath, currentMtime)
+    } catch {
+        // index.html doesn't exist or can't be read — skip
+    }
+}
+
 // In-memory dedup set for background refresh
 const refreshInFlight = new Set<string>()
 
@@ -692,6 +713,7 @@ app.use(async (req: Request, res: Response, next: () => void) => {
 
         if (fs.existsSync(indexPath)) {
             if (shouldRender(effectiveConfig.ssr, isRenderXRequest, false, isInternalRender)) {
+                await invalidateCacheIfSourceChanged(sourcePath)
                 const cacheKey = origin
                     ? `${origin}${req.originalUrl}`
                     : `${req.protocol}://${originHostname}${req.originalUrl}`
@@ -727,6 +749,7 @@ app.use(async (req: Request, res: Response, next: () => void) => {
     if (fs.existsSync(indexPath)) {
         const isDirectFile = isFilePath(req.path)
         if (shouldRender(effectiveConfig.ssr, isRenderXRequest, isDirectFile, isInternalRender)) {
+            await invalidateCacheIfSourceChanged(sourcePath)
             const cacheKey = origin
                 ? `${origin}${req.originalUrl}`
                 : `${req.protocol}://${originHostname}${req.originalUrl}`

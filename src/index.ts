@@ -310,6 +310,24 @@ const isFilePath = (filePath: string): boolean => {
     return ext !== '' && ext !== '/'
 }
 
+// Content-hash pattern: a separator (.|-) followed by an 8+ char token that
+// contains at least one digit, then the extension. Matches webpack-style
+// (main.1a2b3c4d.js) and Vite-style (index-Dea4n0lr.js) hashed assets while
+// excluding non-hashed names like app.production.js or styles.responsive.css.
+const CONTENT_HASH_PATTERN = /[.-](?=[A-Za-z0-9_-]{8,}\.)[A-Za-z0-9_-]*\d[A-Za-z0-9_-]*\.\w+$/
+
+const sendStaticFile = (res: Response, filePath: string): void => {
+    const ext = path.extname(filePath).toLowerCase()
+
+    if (ext === '.html' || ext === '.htm') {
+        res.setHeader('Cache-Control', 'no-cache')
+    } else if (CONTENT_HASH_PATTERN.test(path.basename(filePath))) {
+        res.setHeader('Cache-Control', 'public, max-age=31536000, immutable')
+    }
+
+    res.sendFile(filePath)
+}
+
 const shouldRender = (
     ssrEnabled: boolean,
     isRenderXRequest: boolean,
@@ -408,6 +426,7 @@ const renderPage = async (
     if (cached) {
         ;(res as Response & { _cacheHit?: boolean })._cacheHit = true
         res.setHeader('Content-Type', 'text/html; charset=utf-8')
+        res.setHeader('Cache-Control', 'no-cache')
         res.send(cached.html)
 
         if (cached.stale) {
@@ -433,9 +452,15 @@ const renderPage = async (
         )
 
         if (html) {
+            const isErrorPage = html.length < 500 && html.includes('"error"')
+            if (isErrorPage) {
+                logger.warn(`SSR produced error page for ${cacheKey} (${html.length} bytes), skipping cache`)
+                return false
+            }
             await cache.set(cacheKey, html, 'desktop', effectiveConfig.cacheTtl)
             ;(res as Response & { _cacheHit?: boolean })._cacheHit = false
             res.setHeader('Content-Type', 'text/html; charset=utf-8')
+            res.setHeader('Cache-Control', 'no-cache')
             res.send(html)
             return true
         }
@@ -601,12 +626,12 @@ app.use(async (req: Request, res: Response, next: () => void) => {
             if (validatedFilePath && fs.existsSync(validatedFilePath)) {
                 const stats = fs.statSync(validatedFilePath)
                 if (stats.isFile()) {
-                    return res.sendFile(validatedFilePath)
+                    return sendStaticFile(res, validatedFilePath)
                 }
                 if (stats.isDirectory()) {
                     const indexPath = path.join(validatedFilePath, 'index.html')
                     if (fs.existsSync(indexPath)) {
-                        return res.sendFile(indexPath)
+                        return sendStaticFile(res, indexPath)
                     }
                 }
             }
@@ -614,7 +639,7 @@ app.use(async (req: Request, res: Response, next: () => void) => {
             if (!isFileRequest) {
                 const indexPath = path.join(sourcePath, 'index.html')
                 if (fs.existsSync(indexPath)) {
-                    return res.sendFile(indexPath)
+                    return sendStaticFile(res, indexPath)
                 }
             }
         }
@@ -629,12 +654,12 @@ app.use(async (req: Request, res: Response, next: () => void) => {
             if (validatedFilePath && fs.existsSync(validatedFilePath)) {
                 const stats = fs.statSync(validatedFilePath)
                 if (stats.isFile()) {
-                    return res.sendFile(validatedFilePath)
+                    return sendStaticFile(res, validatedFilePath)
                 }
                 if (stats.isDirectory()) {
                     const indexPath = path.join(validatedFilePath, 'index.html')
                     if (fs.existsSync(indexPath)) {
-                        return res.sendFile(indexPath)
+                        return sendStaticFile(res, indexPath)
                     }
                 }
             }
@@ -646,7 +671,7 @@ app.use(async (req: Request, res: Response, next: () => void) => {
                 const sourcePath = path.join(process.cwd(), './hosts', hostConfig.source)
                 const indexPath = path.join(sourcePath, 'index.html')
                 if (fs.existsSync(indexPath)) {
-                    return res.sendFile(indexPath)
+                    return sendStaticFile(res, indexPath)
                 }
             }
         }
@@ -654,16 +679,31 @@ app.use(async (req: Request, res: Response, next: () => void) => {
         return sendError(res, 404, 'Not found')
     }
 
-    // Serve files without origin from any host
+    // Serve files without origin: prefer the requested Host's own files
     if (isFileRequest && !origin) {
+        const hostHostname = req.headers.host?.split(':')[0] || ''
+        const requestedHost = hostHostname ? getHostConfig(hostHostname) : null
+
+        // 1) Try the requested host first
+        if (requestedHost && requestedHost.isActive !== false) {
+            const sourcePath = path.join(process.cwd(), './hosts', requestedHost.source)
+            const validatedFilePath = validatePath(sourcePath, req.path)
+
+            if (validatedFilePath && fs.existsSync(validatedFilePath) && fs.statSync(validatedFilePath).isFile()) {
+                return sendStaticFile(res, validatedFilePath)
+            }
+        }
+
+        // 2) Fall back to any other host for genuinely shared/static assets
         for (const hostConfig of globalConfig.hosts) {
             if (hostConfig.isActive === false) continue
+            if (requestedHost && hostConfig.source === requestedHost.source) continue
 
             const sourcePath = path.join(process.cwd(), './hosts', hostConfig.source)
             const validatedFilePath = validatePath(sourcePath, req.path)
 
             if (validatedFilePath && fs.existsSync(validatedFilePath) && fs.statSync(validatedFilePath).isFile()) {
-                return res.sendFile(validatedFilePath)
+                return sendStaticFile(res, validatedFilePath)
             }
         }
     }
@@ -721,10 +761,11 @@ app.use(async (req: Request, res: Response, next: () => void) => {
                 const localUrl = `http://localhost:${globalConfig.port}${req.originalUrl}`
                 const signal = (res as Response & { renderAbortSignal?: AbortSignal }).renderAbortSignal
 
-                const rendered = await renderPage(res, cacheKey, localUrl, origin || undefined, effectiveConfig, signal)
+                const effectiveOrigin = origin || `http://${originHostname}`
+                const rendered = await renderPage(res, cacheKey, localUrl, effectiveOrigin, effectiveConfig, signal)
                 if (rendered) return
             }
-            return res.sendFile(indexPath)
+            return sendStaticFile(res, indexPath)
         }
         return sendError(res, 404, 'Not found', `index.html not found in source directory: ${sourcePath}`)
     }
@@ -733,13 +774,13 @@ app.use(async (req: Request, res: Response, next: () => void) => {
     const validatedFilePath = validatePath(sourcePath, req.path)
     if (validatedFilePath && fs.existsSync(validatedFilePath)) {
         if (fs.statSync(validatedFilePath).isFile()) {
-            return res.sendFile(validatedFilePath)
+            return sendStaticFile(res, validatedFilePath)
         }
 
         if (fs.statSync(validatedFilePath).isDirectory()) {
             const indexPath = path.join(validatedFilePath, 'index.html')
             if (fs.existsSync(indexPath)) {
-                return res.sendFile(indexPath)
+                return sendStaticFile(res, indexPath)
             }
         }
     }
@@ -757,11 +798,12 @@ app.use(async (req: Request, res: Response, next: () => void) => {
             const localUrl = `http://localhost:${globalConfig.port}${req.originalUrl}`
             const signal = (res as Response & { renderAbortSignal?: AbortSignal }).renderAbortSignal
 
-            const rendered = await renderPage(res, cacheKey, localUrl, origin || undefined, effectiveConfig, signal)
+            const effectiveOrigin = origin || `http://${originHostname}`
+            const rendered = await renderPage(res, cacheKey, localUrl, effectiveOrigin, effectiveConfig, signal)
             if (rendered) return
         }
 
-        return res.sendFile(indexPath)
+        return sendStaticFile(res, indexPath)
     }
 
     return sendError(res, 404, 'Not found')

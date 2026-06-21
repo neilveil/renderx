@@ -29,7 +29,8 @@ const createContext = async (browser: Browser): Promise<BrowserContext> => {
         viewport: { width: 1920, height: 1080 },
         permissions: [],
         javaScriptEnabled: true,
-        acceptDownloads: false
+        acceptDownloads: false,
+        serviceWorkers: 'block'
     })
 }
 

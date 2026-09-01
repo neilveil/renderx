@@ -1,9 +1,10 @@
+*.md
 .cache
 .cursor
 .git
+.github
 .gitignore
-*.md
+.tmp
 demo-app
 node_modules
 readme.md
-tmp

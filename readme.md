@@ -315,6 +315,28 @@ Requests are queued when the server is at render capacity (not rejected). Backgr
 
 RenderX always waits for network idle to ensure pages are fully loaded.
 
+## Releasing
+
+Images are published to [`neilveil/renderx`](https://hub.docker.com/r/neilveil/renderx) by CI when a
+`prod-v{version}` tag is pushed. Both `linux/amd64` and `linux/arm64` are built, and the release is
+tagged `{version}` and `latest`.
+
+```bash
+# 1. bump "version" in package.json, then commit it
+# 2. tag and push
+git tag prod-v1.1.0
+git push origin prod-v1.1.0
+```
+
+The workflow refuses to publish when the tag version does not match `package.json`, or when that
+version is already on Docker Hub — image tags are mutable, and deployments pin them.
+
+To publish by hand when CI is unavailable:
+
+```bash
+./build.sh 1.1.0
+```
+
 ## License
 
 MIT

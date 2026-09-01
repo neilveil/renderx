@@ -1,0 +1,91 @@
+name: Publish Docker image
+
+# Releases are cut by pushing a prod-v{version} tag, e.g. prod-v1.1.0
+on:
+    push:
+        tags:
+            - 'prod-v*'
+
+# Never let two tag pushes race to publish the same image
+concurrency:
+    group: publish-${{ github.ref }}
+    cancel-in-progress: false
+
+env:
+    IMAGE: neilveil/renderx
+
+jobs:
+    publish:
+        runs-on: ubuntu-latest
+
+        steps:
+            - uses: actions/checkout@v4
+
+            - name: Resolve version from tag
+              id: version
+              run: |
+                  VERSION="${GITHUB_REF_NAME#prod-v}"
+                  if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                      echo "::error::Tag '$GITHUB_REF_NAME' must be prod-vMAJOR.MINOR.PATCH"
+                      exit 1
+                  fi
+                  echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+            - uses: actions/setup-node@v4
+              with:
+                  node-version: 20
+                  cache: npm
+
+            # The tag and package.json drifting apart is the whole reason this workflow exists
+            - name: Verify tag matches package.json
+              run: |
+                  PACKAGE_VERSION=$(node -p "require('./package.json').version")
+                  if [[ "$PACKAGE_VERSION" != "${{ steps.version.outputs.version }}" ]]; then
+                      echo "::error::Tag says ${{ steps.version.outputs.version }}, package.json says $PACKAGE_VERSION"
+                      exit 1
+                  fi
+
+            # Docker Hub tags are mutable and production pins one, so overwriting an existing
+            # tag would silently change what the server pulls on its next recreate
+            - name: Refuse to overwrite a published tag
+              run: |
+                  STATUS=$(curl -s -o /dev/null -w '%{http_code}' \
+                      "https://hub.docker.com/v2/repositories/${IMAGE}/tags/${{ steps.version.outputs.version }}")
+                  if [[ "$STATUS" == "200" ]]; then
+                      echo "::error::${IMAGE}:${{ steps.version.outputs.version }} is already published"
+                      exit 1
+                  fi
+
+            # --ignore-scripts skips the Playwright browser download; the image supplies it
+            - name: Install dependencies
+              run: npm ci --ignore-scripts
+
+            - name: Type check
+              run: npm run type-check
+
+            - uses: docker/setup-qemu-action@v3
+            - uses: docker/setup-buildx-action@v3
+
+            - uses: docker/login-action@v3
+              with:
+                  username: ${{ secrets.DOCKERHUB_USERNAME }}
+                  password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+            # One invocation builds and pushes both architectures; a multi-arch manifest
+            # cannot be produced by building locally and tagging afterwards
+            - name: Build and push
+              uses: docker/build-push-action@v6
+              with:
+                  context: .
+                  platforms: linux/amd64,linux/arm64
+                  push: true
+                  tags: |
+                      ${{ env.IMAGE }}:${{ steps.version.outputs.version }}
+                      ${{ env.IMAGE }}:latest
+                  cache-from: type=gha
+                  cache-to: type=gha,mode=max
+
+            - name: Summary
+              run: |
+                  echo "Published ${IMAGE}:${{ steps.version.outputs.version }} and ${IMAGE}:latest" >> "$GITHUB_STEP_SUMMARY"
+                  echo "Deploy with: docker pull ${IMAGE}:${{ steps.version.outputs.version }}" >> "$GITHUB_STEP_SUMMARY"

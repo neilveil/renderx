@@ -3,7 +3,7 @@ import express, { NextFunction, Request, Response } from 'express'
 import fs from 'fs'
 import path from 'path'
 import cache, { startCleanupInterval, stopCleanupInterval } from './cache'
-import { getConfig, getEffectiveConfig, getHostConfig, HostConfig } from './config'
+import { decodeRequestPath, getConfig, getEffectiveConfig, getHostConfig, HostConfig } from './config'
 import { logger } from './logger'
 import { isBrowserReady, preLaunchBrowser, render } from './renderer'
 import { enqueue, getQueueStats } from './renderQueue'
@@ -74,9 +74,23 @@ const sendError = (res: Response, statusCode: number, error: string, message?: s
 }
 
 const validatePath = (basePath: string, requestedPath: string): string | null => {
-    const relativePath = requestedPath.startsWith('/') ? requestedPath.slice(1) : requestedPath
+    // Assets whose filenames contain spaces or parentheses (common in Vite builds) only
+    // resolve on disk once the request path is decoded.
+    const decodedPath = decodeRequestPath(requestedPath)
+    if (decodedPath === null) {
+        logger.warn(`Rejected malformed request path: ${requestedPath}`)
+        return null
+    }
+
+    // Null bytes truncate paths in some syscalls and are never legitimate
+    if (decodedPath.includes('\0')) {
+        return null
+    }
+
+    const relativePath = decodedPath.startsWith('/') ? decodedPath.slice(1) : decodedPath
     const normalizedPath = path.normalize(relativePath)
 
+    // Traversal is checked after decoding so an encoded "%2e%2e" cannot slip past it
     if (normalizedPath.includes('..') || path.isAbsolute(normalizedPath)) {
         return null
     }
@@ -84,7 +98,8 @@ const validatePath = (basePath: string, requestedPath: string): string | null =>
     const resolvedPath = path.resolve(basePath, normalizedPath)
     const resolvedBase = path.resolve(basePath)
 
-    if (!resolvedPath.startsWith(resolvedBase)) {
+    // Compare against the base plus a separator so "hosts/app" cannot match "hosts/app-other"
+    if (resolvedPath !== resolvedBase && !resolvedPath.startsWith(resolvedBase + path.sep)) {
         return null
     }
 
@@ -306,7 +321,11 @@ app.get('/health', async (_req: Request, res: Response) => {
 })
 
 const isFilePath = (filePath: string): boolean => {
-    const ext = path.extname(filePath)
+    // Decode first so an encoded extension is still recognised as an asset request.
+    // A malformed path falls back to the raw value; validatePath rejects it later.
+    const decodedPath = decodeRequestPath(filePath) ?? filePath
+
+    const ext = path.extname(decodedPath)
     return ext !== '' && ext !== '/'
 }
 

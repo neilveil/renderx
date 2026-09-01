@@ -114,6 +114,16 @@ const matchesGlobPattern = (pattern: string, hostname: string): boolean => {
     return regex.test(hostname)
 }
 
+// Express leaves req.path percent-encoded, so every path inspection decodes through here.
+// Returns null for malformed escape sequences, which are never valid request paths.
+export const decodeRequestPath = (requestPath: string): string | null => {
+    try {
+        return decodeURIComponent(requestPath)
+    } catch {
+        return null
+    }
+}
+
 export const getHostConfig = (hostname: string): HostConfig | null => {
     const config = loadConfig()
 

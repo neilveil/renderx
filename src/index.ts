@@ -3,7 +3,7 @@ import express, { NextFunction, Request, Response } from 'express'
 import fs from 'fs'
 import path from 'path'
 import cache, { startCleanupInterval, stopCleanupInterval } from './cache'
-import { decodeRequestPath, getConfig, getEffectiveConfig, getHostConfig, HostConfig } from './config'
+import { decodeRequestPath, getConfig, getEffectiveConfig, getHostConfig, HostConfig, isSsrExcludedPath } from './config'
 import { logger } from './logger'
 import { isBrowserReady, preLaunchBrowser, render } from './renderer'
 import { enqueue, getQueueStats } from './renderQueue'
@@ -221,7 +221,8 @@ app.use((req: Request, res: Response, next: () => void) => {
             strategy = 'static'
         } else {
             const effectiveConfig = getEffectiveConfig(hostname)
-            strategy = effectiveConfig.ssr ? 'ssr' : 'static'
+            const isCsrOnlyRoute = isSsrExcludedPath(effectiveConfig.ssrExclude, req.path)
+            strategy = effectiveConfig.ssr && !isCsrOnlyRoute ? 'ssr' : 'static'
         }
     } catch {
         strategy = 'static'
@@ -348,7 +349,8 @@ const sendStaticFile = (res: Response, filePath: string): void => {
 }
 
 const shouldRender = (
-    ssrEnabled: boolean,
+    effectiveConfig: Pick<ReturnType<typeof getEffectiveConfig>, 'ssr' | 'ssrExclude'>,
+    requestPath: string,
     isRenderXRequest: boolean,
     isDirectFile: boolean,
     isInternalRender: boolean = false
@@ -357,7 +359,10 @@ const shouldRender = (
     if (isRenderXRequest) return false
     if (isDirectFile) return false
 
-    return ssrEnabled
+    // Routes listed in ssrExclude stay pure CSR — index.html is served untouched
+    if (isSsrExcludedPath(effectiveConfig.ssrExclude, requestPath)) return false
+
+    return effectiveConfig.ssr
 }
 
 // Track index.html mtime per source directory to auto-invalidate SSR cache on deploy
@@ -771,7 +776,7 @@ app.use(async (req: Request, res: Response, next: () => void) => {
         const indexPath = path.join(sourcePath, 'index.html')
 
         if (fs.existsSync(indexPath)) {
-            if (shouldRender(effectiveConfig.ssr, isRenderXRequest, false, isInternalRender)) {
+            if (shouldRender(effectiveConfig, req.path, isRenderXRequest, false, isInternalRender)) {
                 await invalidateCacheIfSourceChanged(sourcePath)
                 const cacheKey = origin
                     ? `${origin}${req.originalUrl}`
@@ -808,7 +813,7 @@ app.use(async (req: Request, res: Response, next: () => void) => {
     const indexPath = path.join(sourcePath, 'index.html')
     if (fs.existsSync(indexPath)) {
         const isDirectFile = isFilePath(req.path)
-        if (shouldRender(effectiveConfig.ssr, isRenderXRequest, isDirectFile, isInternalRender)) {
+        if (shouldRender(effectiveConfig, req.path, isRenderXRequest, isDirectFile, isInternalRender)) {
             await invalidateCacheIfSourceChanged(sourcePath)
             const cacheKey = origin
                 ? `${origin}${req.originalUrl}`

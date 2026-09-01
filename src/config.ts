@@ -14,6 +14,8 @@ export interface HostConfig {
     timeoutMs?: number
     parallelRenders?: number
     ssr?: boolean
+    // Path globs served as plain CSR even when ssr is on, e.g. ['/app', '/app/*']
+    ssrExclude?: string[]
     rootSelector?: string
     htmlOptimizerOptions?: HtmlOptimizerOptions
 }
@@ -25,6 +27,7 @@ export interface GlobalConfig {
     parallelRenders: number
     cacheCleanupInterval?: number
     ssr: boolean
+    ssrExclude?: string[]
     hosts: HostConfig[]
     logs?: LogLevel
     rootSelector?: string
@@ -87,6 +90,7 @@ const loadConfig = (): GlobalConfig => {
             10
         ),
         ssr: ssrEnabled,
+        ssrExclude: fileConfig.ssrExclude || [],
         hosts: fileConfig.hosts || [],
         logs: (process.env.LOGS || fileConfig.logs || 'ssr') as LogLevel,
         timeoutMs: parseInt(process.env.TIMEOUT_MS || '10000', 10),
@@ -100,8 +104,10 @@ export const getConfig = (): GlobalConfig => {
     return loadConfig()
 }
 
-const matchesGlobPattern = (pattern: string, hostname: string): boolean => {
-    if (pattern === hostname) return true
+// Shared `*` glob matcher used for both host patterns and SSR path exclusions.
+// `*` spans any characters including `/`, so '/app/*' also covers '/app/a/b'.
+const matchesGlobPattern = (pattern: string, value: string): boolean => {
+    if (pattern === value) return true
     if (pattern === '*') return true
 
     const placeholder = '__WILDCARD_PLACEHOLDER__'
@@ -111,7 +117,7 @@ const matchesGlobPattern = (pattern: string, hostname: string): boolean => {
         .replace(new RegExp(placeholder.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '.*')
 
     const regex = new RegExp(`^${escapedPattern}$`)
-    return regex.test(hostname)
+    return regex.test(value)
 }
 
 // Express leaves req.path percent-encoded, so every path inspection decodes through here.
@@ -122,6 +128,16 @@ export const decodeRequestPath = (requestPath: string): string | null => {
     } catch {
         return null
     }
+}
+
+// True when the request path is listed as CSR-only for this host
+export const isSsrExcludedPath = (patterns: string[] | undefined, requestPath: string): boolean => {
+    if (!patterns || !patterns.length) return false
+
+    const decodedPath = decodeRequestPath(requestPath) ?? requestPath
+    const normalizedPath = decodedPath.startsWith('/') ? decodedPath : `/${decodedPath}`
+
+    return patterns.some(pattern => matchesGlobPattern(pattern, normalizedPath))
 }
 
 export const getHostConfig = (hostname: string): HostConfig | null => {
@@ -143,6 +159,7 @@ export const getEffectiveConfig = (hostname?: string): {
     source: string | null
     logs: LogLevel
     ssr: boolean
+    ssrExclude: string[] | undefined
     rootSelector: string | undefined
     clearCacheOnStartup: boolean
     htmlOptimizerOptions: HtmlOptimizerOptions | undefined
@@ -160,6 +177,7 @@ export const getEffectiveConfig = (hostname?: string): {
         source: host?.source ?? null,
         logs: global.logs ?? 'ssr',
         ssr: host?.ssr ?? global.ssr ?? true,
+        ssrExclude: host?.ssrExclude ?? global.ssrExclude,
         rootSelector: host?.rootSelector ?? global.rootSelector,
         clearCacheOnStartup: global.clearCacheOnStartup ?? true,
         htmlOptimizerOptions: host?.htmlOptimizerOptions ?? global.htmlOptimizerOptions,

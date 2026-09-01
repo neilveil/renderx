@@ -71,6 +71,22 @@ To disable SSR globally (e.g., while troubleshooting browser issues):
 }
 ```
 
+To keep SSR on but serve specific routes as pure CSR, list them in `ssrExclude`. Useful for logged-in areas that have no SEO value and should not be rendered or cached:
+
+```json
+{
+    "hosts": [
+        {
+            "source": "my-app",
+            "host": "my-app.com",
+            "ssrExclude": ["/app", "/app/*"]
+        }
+    ]
+}
+```
+
+Excluded routes are served straight from `index.html`, with no render and no cache entry. Patterns use the same `*` wildcard as `host`, and `*` spans `/`, so `/app/*` also covers `/app/settings/billing`. Set `ssrExclude` at the top level to apply it to every host; a host-level list replaces the global one.
+
 **Glob Pattern Examples:**
 
 You can use glob patterns with `*` wildcards in the `host` field:
@@ -106,6 +122,7 @@ interface HostConfig {
     timeoutMs?: number
     parallelRenders?: number
     ssr?: boolean
+    ssrExclude?: string[]
 }
 
 interface GlobalConfig {
@@ -113,6 +130,7 @@ interface GlobalConfig {
     parallelRenders?: number
     cacheCleanupInterval?: number
     ssr?: boolean
+    ssrExclude?: string[]
     hosts?: HostConfig[]
     logs?: 'none' | 'ssr' | 'all'
     logFormat?: 'text' | 'json'
@@ -192,14 +210,14 @@ Server runs on `http://localhost` (port 80)
 
 1. **Request arrives** with Origin header
 2. **Host matching**: Find the matching host config
-3. **SSR check**: If `ssr` is disabled, serve static files. Otherwise, check cache.
+3. **SSR check**: If `ssr` is disabled or the path matches `ssrExclude`, serve static files. Otherwise, check cache.
 4. **Cache check**: Fresh hit serves instantly. Stale hit serves instantly and triggers a background re-render. Miss triggers a full render.
 
 ### Request Flow
 
 ```mermaid
 flowchart TD
-    A[Request Arrives] --> B{SSR Enabled?}
+    A[Request Arrives] --> B{SSR Enabled and<br>Path Not Excluded?}
     B -->|No| C[Serve Static File]
     B -->|Yes| D{Check Cache}
     D -->|Fresh Hit| E[Serve Cached HTML]
@@ -220,6 +238,7 @@ All global settings are optional and will use defaults if not specified:
 | ---------------------- | ------- | -------- | --------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
 | `port`                 | number  | No       | `8080`    | Server port inside container                                                                                                                   |
 | `ssr`                  | boolean | No       | `true`    | Enable or disable SSR globally. Set to `false` to serve static files only (useful as a kill switch when SSR is failing).                        |
+| `ssrExclude`           | array   | No       | `[]`      | Route glob patterns served as pure CSR even when `ssr` is enabled (e.g. `["/app", "/app/*"]`). No render, no cache entry.                       |
 | `parallelRenders`      | number  | No       | `10`      | Maximum number of parallel page renders                                                                                                        |
 | `cacheCleanupInterval` | number  | No       | `60`      | Cache cleanup interval in minutes. Also determines cache TTL: entries go stale after half this time, and are cleaned after 2x this time.        |
 | `logs`                 | string  | No       | `"ssr"`   | Logging level: `"none"` (no request logs), `"ssr"` (SSR/SSR-CACHE/SSR-REFRESH logs only), `"all"` (all logs including STATIC)                  |
@@ -236,6 +255,7 @@ Each host configuration supports:
 | `host`            | string  | Yes      | -        | Your domain name (e.g., "my-app.com"). Supports glob patterns with `*` wildcard:<br>- `*` matches all domains<br>- `*.my-app.com` matches all subdomains (e.g., `app.my-app.com`, `api.my-app.com`)<br>- Exact matches take priority over glob patterns |
 | `isActive`        | boolean | No       | `true`   | Set to `true` to enable this host                                                                                                                                                                                                                       |
 | `ssr`             | boolean | No       | `true`   | Enable or disable SSR for this host. Overrides global setting. Set to `false` to serve static files only.                                                                                                                                               |
+| `ssrExclude`      | array   | No       | `[]`     | Route glob patterns served as pure CSR even when `ssr` is enabled (e.g. `["/app", "/app/*"]`). Overrides the global list. `*` spans `/`, so `/app/*` also covers `/app/settings/billing`.                                                                |
 | `timeoutMs`       | number  | No       | `10000`  | Maximum time to wait for page load in milliseconds                                                                                                                                                                                                      |
 | `parallelRenders` | number  | No       | `10`     | Maximum parallel renders for this host. Overrides global setting.                                                                                                                                                                                       |
 

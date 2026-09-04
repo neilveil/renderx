@@ -208,24 +208,39 @@ Server runs on `http://localhost` (port 80)
 
 ## How It Works
 
-1. **Request arrives** with Origin header
-2. **Host matching**: Find the matching host config
+1. **Host resolution**: the `Origin` header if present, otherwise `Host`. A host that matches no config is refused with `403`.
+2. **File resolution**: inside that host's `source` directory and nowhere else.
 3. **SSR check**: If `ssr` is disabled or the path matches `ssrExclude`, serve static files. Otherwise, check cache.
 4. **Cache check**: Fresh hit serves instantly. Stale hit serves instantly and triggers a background re-render. Miss triggers a full render.
+
+### Host Isolation
+
+Each host resolves to exactly one directory. Hosts never fall back to one another, so a file
+present in one host's `source` is not reachable from another host's domain, and the order of the
+`hosts` array never affects what a given host serves.
+
+A path that names a file (it has an extension) and matches nothing returns `404` — it is never
+answered with `index.html`. Extensionless paths do fall through to the host's `index.html`, which
+is what makes client-side routing work. Share an asset between two sites by copying it into both
+builds.
 
 ### Request Flow
 
 ```mermaid
 flowchart TD
-    A[Request Arrives] --> B{SSR Enabled and<br>Path Not Excluded?}
-    B -->|No| C[Serve Static File]
-    B -->|Yes| D{Check Cache}
-    D -->|Fresh Hit| E[Serve Cached HTML]
-    D -->|Stale Hit| F[Serve Cached HTML]
-    F --> G[Background Re-render]
-    D -->|Miss| H[Render with Headless Browser]
-    H --> I[Cache Result]
-    I --> J[Serve Rendered HTML]
+    A[Request arrives] --> B{Host configured?}
+    B -->|No| C[403]
+    B -->|Yes| D{File in this<br>host's directory?}
+    D -->|Yes| E[Serve file]
+    D -->|No| F{Path has<br>an extension?}
+    F -->|Yes| G[404]
+    F -->|No| H{SSR enabled and<br>path not excluded?}
+    H -->|No| I[Serve index.html]
+    H -->|Yes| J{Check cache}
+    J -->|Fresh hit| K[Serve cached HTML]
+    J -->|Stale hit| L[Serve cached HTML<br>and re-render in background]
+    J -->|Miss| M[Render with headless browser]
+    M --> N[Cache and serve]
 ```
 
 ## Configuration Options

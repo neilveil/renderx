@@ -1,9 +1,15 @@
+import { randomUUID } from 'crypto'
 import dotenv from 'dotenv'
 import fs from 'fs'
 import path from 'path'
 import { HtmlOptimizerOptions } from './htmlOptimizer'
 
 dotenv.config()
+
+// The render browser fetches pages back from this same server. Those sub-requests carry
+// this token so they can be told apart from real traffic; a fixed value like "true" could
+// simply be typed by anyone. Regenerated every boot and never sent to a client.
+export const INTERNAL_RENDER_TOKEN = randomUUID()
 
 export type LogFormat = 'text' | 'json'
 

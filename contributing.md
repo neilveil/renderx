@@ -58,32 +58,44 @@ RenderX is a TypeScript service that uses Playwright to render client-side appli
 ### Request Flow
 
 ```
-1. Request arrives with Origin header
-2. Parse hostname from Origin
-3. Find matching host config
-4. Check SSR flag:
+1. Request arrives
+2. Resolve hostname from Origin if present, otherwise from Host
+3. Find matching host config — no match is a 403
+4. Look for the file in that host's source directory only, never another host's
+5. File found: serve it
+6. No file, path has an extension: 404
+7. No file, extensionless path: check SSR flag
    - ssr enabled (default): Check cache → render if miss
-   - ssr disabled: Serve static files
-5. If rendering:
+   - ssr disabled: Serve index.html
+8. If rendering:
    - Check cache (fresh/stale/miss)
    - If fresh hit: return cached HTML
    - If stale hit: return cached HTML + background refresh
    - If miss: render with Playwright, cache, return
-6. If not rendering:
-   - Serve static files directly
 ```
 
 ### Rendering Process
 
 1. Acquire pre-warmed browser context from pool
 2. Create new page
-3. Set per-request `RenderX/1.0` user agent via route interception (prevents loops)
-4. Set Origin header via route interception
+3. Set per-request `RenderX/1.0` user agent via route interception
+4. Set Origin header and the internal render token via route interception
 5. Block non-essential resources (images, fonts)
 6. Navigate to local URL (`http://localhost:{port}{path}`)
 7. Wait for readiness (networkidle, selector, or load)
 8. Extract HTML
 9. Close page, release context back to pool
+
+#### The internal render token
+
+The browser fetches pages back from the same server, so those sub-requests have to be
+distinguishable from real traffic — otherwise each one would trigger another render and recurse.
+`src/config.ts` generates `INTERNAL_RENDER_TOKEN` at startup, the renderer sends it as
+`X-RenderX-Internal`, and the router treats only a matching value as internal.
+
+The token is a per-boot secret, not a flag. A fixed value could be set by any client, which would
+let anyone skip SSR or reach the internal file-serving path. Nothing outside the process ever sees
+it, and the `RenderX/1.0` user agent is sent for identification only — it grants nothing.
 
 ### Caching
 

@@ -63,6 +63,9 @@ jobs:
             - name: Type check
               run: npm run type-check
 
+            - name: Test
+              run: npm test
+
             - uses: docker/setup-qemu-action@v3
             - uses: docker/setup-buildx-action@v3
 

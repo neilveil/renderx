@@ -1,7 +1,7 @@
 import { Browser, BrowserContext, chromium, Page } from 'playwright'
 import { acquire, destroyPool, initPool, release } from './contextPool'
 import { logger } from './logger'
-import { getConfig } from './config'
+import { getConfig, INTERNAL_RENDER_TOKEN } from './config'
 import { initRenderQueue } from './renderQueue'
 
 export type RenderConfig = {
@@ -194,7 +194,7 @@ export const render = async (
                 if (origin) {
                     headers['Origin'] = origin
                 }
-                headers['X-RenderX-Internal'] = 'true'
+                headers['X-RenderX-Internal'] = INTERNAL_RENDER_TOKEN
 
                 if (userAgent) {
                     headers['User-Agent'] = userAgent

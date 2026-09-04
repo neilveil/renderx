@@ -3,7 +3,15 @@ import express, { NextFunction, Request, Response } from 'express'
 import fs from 'fs'
 import path from 'path'
 import cache, { startCleanupInterval, stopCleanupInterval } from './cache'
-import { decodeRequestPath, getConfig, getEffectiveConfig, getHostConfig, HostConfig, isSsrExcludedPath } from './config'
+import {
+    decodeRequestPath,
+    getConfig,
+    getEffectiveConfig,
+    getHostConfig,
+    HostConfig,
+    INTERNAL_RENDER_TOKEN,
+    isSsrExcludedPath
+} from './config'
 import { logger } from './logger'
 import { isBrowserReady, preLaunchBrowser, render } from './renderer'
 import { enqueue, getQueueStats } from './renderQueue'
@@ -197,9 +205,7 @@ app.use((req: Request, res: Response, next: () => void) => {
     const startTime = Date.now()
     const origin = req.headers.origin
     const host = req.headers.host?.split(':')[0] || 'unknown'
-    const userAgent = req.headers['user-agent'] || ''
-    const isRenderXRequest = userAgent.toLowerCase().includes('renderx')
-    const isInternalRender = req.headers['x-renderx-internal'] === 'true'
+    const isInternalRender = req.headers['x-renderx-internal'] === INTERNAL_RENDER_TOKEN
     const isFileRequest = isFilePath(req.path)
 
     let hostname = 'unknown'
@@ -217,7 +223,7 @@ app.use((req: Request, res: Response, next: () => void) => {
     const managementPaths = ['/health', '/render', '/cache/invalidate', '/cache/clear']
     let strategy = 'static'
     try {
-        if (isInternalRender || isRenderXRequest || isFileRequest || managementPaths.includes(req.path)) {
+        if (isInternalRender || isFileRequest || managementPaths.includes(req.path)) {
             strategy = 'static'
         } else {
             const effectiveConfig = getEffectiveConfig(hostname)
@@ -351,13 +357,11 @@ const sendStaticFile = (res: Response, filePath: string): void => {
 const shouldRender = (
     effectiveConfig: Pick<ReturnType<typeof getEffectiveConfig>, 'ssr' | 'ssrExclude'>,
     requestPath: string,
-    isRenderXRequest: boolean,
-    isDirectFile: boolean,
-    isInternalRender: boolean = false
+    isInternalRender: boolean
 ): boolean => {
+    // The render browser loads pages from this same server; rendering its own
+    // sub-requests again would recurse until the queue drowns
     if (isInternalRender) return false
-    if (isRenderXRequest) return false
-    if (isDirectFile) return false
 
     // Routes listed in ssrExclude stay pure CSR — index.html is served untouched
     if (isSsrExcludedPath(effectiveConfig.ssrExclude, requestPath)) return false
@@ -617,9 +621,7 @@ app.use(async (req: Request, res: Response, next: () => void) => {
     }
 
     const origin = req.headers.origin
-    const userAgent = req.headers['user-agent'] || ''
-    const isRenderXRequest = userAgent.toLowerCase().includes('renderx')
-    const isInternalRender = req.headers['x-renderx-internal'] === 'true'
+    const isInternalRender = req.headers['x-renderx-internal'] === INTERNAL_RENDER_TOKEN
     const isFileRequest = isFilePath(req.path)
 
     // Internal render requests: serve files/assets directly
@@ -668,68 +670,7 @@ app.use(async (req: Request, res: Response, next: () => void) => {
             }
         }
 
-        for (const hostConfig of globalConfig.hosts) {
-            if (hostConfig.isActive === false) continue
-            if (targetHostConfig && hostConfig.source === targetHostConfig.source) continue
-
-            const sourcePath = path.join(process.cwd(), './hosts', hostConfig.source)
-            const validatedFilePath = validatePath(sourcePath, req.path)
-
-            if (validatedFilePath && fs.existsSync(validatedFilePath)) {
-                const stats = fs.statSync(validatedFilePath)
-                if (stats.isFile()) {
-                    return sendStaticFile(res, validatedFilePath)
-                }
-                if (stats.isDirectory()) {
-                    const indexPath = path.join(validatedFilePath, 'index.html')
-                    if (fs.existsSync(indexPath)) {
-                        return sendStaticFile(res, indexPath)
-                    }
-                }
-            }
-        }
-
-        if (!isFileRequest) {
-            for (const hostConfig of globalConfig.hosts) {
-                if (hostConfig.isActive === false) continue
-                const sourcePath = path.join(process.cwd(), './hosts', hostConfig.source)
-                const indexPath = path.join(sourcePath, 'index.html')
-                if (fs.existsSync(indexPath)) {
-                    return sendStaticFile(res, indexPath)
-                }
-            }
-        }
-
         return sendError(res, 404, 'Not found')
-    }
-
-    // Serve files without origin: prefer the requested Host's own files
-    if (isFileRequest && !origin) {
-        const hostHostname = req.headers.host?.split(':')[0] || ''
-        const requestedHost = hostHostname ? getHostConfig(hostHostname) : null
-
-        // 1) Try the requested host first
-        if (requestedHost && requestedHost.isActive !== false) {
-            const sourcePath = path.join(process.cwd(), './hosts', requestedHost.source)
-            const validatedFilePath = validatePath(sourcePath, req.path)
-
-            if (validatedFilePath && fs.existsSync(validatedFilePath) && fs.statSync(validatedFilePath).isFile()) {
-                return sendStaticFile(res, validatedFilePath)
-            }
-        }
-
-        // 2) Fall back to any other host for genuinely shared/static assets
-        for (const hostConfig of globalConfig.hosts) {
-            if (hostConfig.isActive === false) continue
-            if (requestedHost && hostConfig.source === requestedHost.source) continue
-
-            const sourcePath = path.join(process.cwd(), './hosts', hostConfig.source)
-            const validatedFilePath = validatePath(sourcePath, req.path)
-
-            if (validatedFilePath && fs.existsSync(validatedFilePath) && fs.statSync(validatedFilePath).isFile()) {
-                return sendStaticFile(res, validatedFilePath)
-            }
-        }
     }
 
     // Parse origin hostname
@@ -776,7 +717,7 @@ app.use(async (req: Request, res: Response, next: () => void) => {
         const indexPath = path.join(sourcePath, 'index.html')
 
         if (fs.existsSync(indexPath)) {
-            if (shouldRender(effectiveConfig, req.path, isRenderXRequest, false, isInternalRender)) {
+            if (shouldRender(effectiveConfig, req.path, isInternalRender)) {
                 await invalidateCacheIfSourceChanged(sourcePath)
                 const cacheKey = origin
                     ? `${origin}${req.originalUrl}`
@@ -809,11 +750,16 @@ app.use(async (req: Request, res: Response, next: () => void) => {
         }
     }
 
+    // A request that names a file and matched none is a miss. Serving the SPA shell here
+    // would answer 200 for every mistyped asset and every absent robots.txt.
+    if (isFileRequest) {
+        return sendError(res, 404, 'Not found')
+    }
+
     // SPA routes: serve index.html (with optional SSR)
     const indexPath = path.join(sourcePath, 'index.html')
     if (fs.existsSync(indexPath)) {
-        const isDirectFile = isFilePath(req.path)
-        if (shouldRender(effectiveConfig, req.path, isRenderXRequest, isDirectFile, isInternalRender)) {
+        if (shouldRender(effectiveConfig, req.path, isInternalRender)) {
             await invalidateCacheIfSourceChanged(sourcePath)
             const cacheKey = origin
                 ? `${origin}${req.originalUrl}`

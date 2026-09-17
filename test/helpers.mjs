@@ -31,6 +31,8 @@ export const cleanEnv = () => {
     return env
 }
 
+// The port is free only until something binds it. Suites run serially (--test-concurrency=1 in
+// package.json) because two suites probing at the same moment were handed the same port in CI
 export const findFreePort = () =>
     new Promise(resolve => {
         const probe = net.createServer()

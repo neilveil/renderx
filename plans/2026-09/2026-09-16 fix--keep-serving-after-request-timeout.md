@@ -26,6 +26,7 @@ The health check was unrelated but landed in the same report: the inline `node -
 - `test/healthcheck.test.mjs` runs `dist/healthcheck.js` against a server whose port is set only in `config.json`, and checks that `PORT` still overrides it.
 - Shared harness extracted to `test/helpers.mjs`; the host-resolution suite uses it unchanged. The harness strips every server-read env var from the fixture environment and fails fast with stderr when the server dies at boot.
 - `npm test`: 19 tests, 4 suites, all passing in under a second.
+- The first `prod-v1.1.2` publish run failed in CI with `EADDRINUSE`: `node --test` runs the four suite files in parallel processes and two `findFreePort()` calls handed out the same port. Suites now run with `--test-concurrency=1`; the tag was moved to the fixed commit before any image was published.
 
 ## Review
 

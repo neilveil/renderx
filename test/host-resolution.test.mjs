@@ -5,15 +5,11 @@
 // SSR is off so no browser is needed — every assertion here is about routing, not rendering.
 
 import assert from 'node:assert/strict'
-import { spawn } from 'node:child_process'
 import fs from 'node:fs'
-import http from 'node:http'
-import net from 'node:net'
 import path from 'node:path'
-import { fileURLToPath } from 'node:url'
 import { after, before, describe, it } from 'node:test'
+import { findFreePort, repoRoot, request as rawRequest, startServer } from './helpers.mjs'
 
-const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const fixtureRoot = path.join(repoRoot, '.tmp', 'test-host-resolution')
 
 let serverProcess
@@ -23,7 +19,7 @@ describe('host resolution', () => {
     before(async () => {
         buildFixture()
         port = await findFreePort()
-        serverProcess = await startServer(port)
+        serverProcess = await startServer({ fixtureRoot, port })
     })
 
     after(() => {
@@ -162,49 +158,4 @@ const buildFixture = () => {
     )
 }
 
-const findFreePort = () =>
-    new Promise(resolve => {
-        const probe = net.createServer()
-        probe.listen(0, () => {
-            const { port: freePort } = probe.address()
-            probe.close(() => resolve(freePort))
-        })
-    })
-
-// config.json and ./hosts both resolve from cwd, so the fixture dir is the working directory
-const startServer = (serverPort) =>
-    new Promise((resolve, reject) => {
-        const child = spawn('node', [path.join(repoRoot, 'dist', 'index.js')], {
-            cwd: fixtureRoot,
-            env: { ...process.env, PORT: String(serverPort), SSR: 'false', LOGS: 'none' }
-        })
-
-        const failed = setTimeout(() => reject(new Error('Server did not start in time')), 20000)
-
-        child.stdout.on('data', chunk => {
-            if (chunk.toString().includes('listening on port')) {
-                clearTimeout(failed)
-                resolve(child)
-            }
-        })
-
-        child.on('error', error => {
-            clearTimeout(failed)
-            reject(error)
-        })
-    })
-
-const request = ({ host, path: requestPath, headers = {} }) =>
-    new Promise((resolve, reject) => {
-        const clientRequest = http.request(
-            { host: '127.0.0.1', port, path: requestPath, headers: { Host: host, ...headers } },
-            response => {
-                let body = ''
-                response.on('data', chunk => (body += chunk))
-                response.on('end', () => resolve({ status: response.statusCode, body }))
-            }
-        )
-
-        clientRequest.on('error', reject)
-        clientRequest.end()
-    })
+const request = options => rawRequest({ port, ...options })

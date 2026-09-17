@@ -40,10 +40,25 @@ export interface GlobalConfig {
     clearCacheOnStartup?: boolean
     htmlOptimizerOptions?: HtmlOptimizerOptions
     timeoutMs?: number
+    // Wall-clock cap per request in ms; past it the timeout middleware answers 504 and aborts the render
+    requestTimeoutMs: number
     logFormat?: LogFormat
 }
 
 let configData: GlobalConfig | null = null
+
+const DEFAULT_REQUEST_TIMEOUT_MS = 30000
+
+// parseInt would turn a typo into NaN, which setTimeout treats as 0 and every request would 504
+const positiveMs = (value: string | undefined, fallback: number, name: string): number => {
+    if (value === undefined || value === '') return fallback
+
+    const parsed = Number(value)
+    if (Number.isFinite(parsed) && parsed > 0) return parsed
+
+    console.warn(`[CONFIG] ${name} must be a positive number of milliseconds, got "${value}". Using ${fallback}.`)
+    return fallback
+}
 
 const loadConfig = (): GlobalConfig => {
     if (configData) return configData
@@ -100,6 +115,11 @@ const loadConfig = (): GlobalConfig => {
         hosts: fileConfig.hosts || [],
         logs: (process.env.LOGS || fileConfig.logs || 'ssr') as LogLevel,
         timeoutMs: parseInt(process.env.TIMEOUT_MS || '10000', 10),
+        requestTimeoutMs: positiveMs(
+            process.env.REQUEST_TIMEOUT_MS || fileConfig.requestTimeoutMs?.toString(),
+            DEFAULT_REQUEST_TIMEOUT_MS,
+            'requestTimeoutMs'
+        ),
         logFormat
     }
 

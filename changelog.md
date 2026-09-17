@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.1.2
+
+**A timed-out request can no longer take the server down.** A burst of scanner probes against an SSR host could end the Node process, and Docker's health check could report a healthy server as unhealthy. Both reported in [#2](https://github.com/neilveil/renderx/issues/2).
+
+### Fixed
+
+-   **Crash on request timeout.** When a render passed the 30s request timeout, the middleware answered `504` and aborted the render, and the route handler then fell back to serving `index.html` on the finished response. The resulting `ERR_HTTP_HEADERS_SENT` escaped the async handler as an unhandled rejection, which exits the process on Node 20. The response helpers now stop when the response is already answered, every async handler routes a throw to an error middleware that logs it and answers `500` when it still can, and an `unhandledRejection` handler logs anything that slips past instead of exiting.
+-   **Docker health check ignored the `config.json` port.** The `HEALTHCHECK` probed `PORT` or `8080`, so a server whose port was set only in `config.json` was reported unhealthy. It now runs `dist/healthcheck.js`, which resolves the port through the same loader as the server.
+
+### Changed
+
+-   Errors raised by Express itself, such as a malformed JSON body on `/cache/invalidate`, keep their status and return the same JSON error shape as every other error. Express used to answer with its HTML error page.
+
+### Added
+
+-   `requestTimeoutMs` in `config.json`, or the `REQUEST_TIMEOUT_MS` env var, sets the per-request timeout that was fixed at 30s. A value that is not a positive number falls back to 30s with a warning at boot.
+-   Request-timeout, error-handling and health-check test suites, run by `npm test`.
+
 ## 1.1.1
 
 **Each host now resolves to exactly one directory.** Requests that previously fell back to another

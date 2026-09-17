@@ -27,6 +27,12 @@ const getLogFormat = (): LogFormat => {
     return logFormat ?? 'text'
 }
 
+// The JSON formatter keeps only an Error's message; a crash report needs the stack
+export const describeError = (error: unknown): string => {
+    if (error instanceof Error) return error.stack ?? error.message
+    return String(error)
+}
+
 const isLoggingEnabled = (): boolean => {
     return getLogsLevel() !== 'none'
 }

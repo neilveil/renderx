@@ -1,4 +1,5 @@
 import { randomUUID } from 'crypto'
+import { STATUS_CODES } from 'http'
 import express, { NextFunction, Request, Response } from 'express'
 import fs from 'fs'
 import path from 'path'
@@ -12,15 +13,15 @@ import {
     INTERNAL_RENDER_TOKEN,
     isSsrExcludedPath
 } from './config'
-import { logger } from './logger'
+import { describeError, logger } from './logger'
 import { isBrowserReady, preLaunchBrowser, render } from './renderer'
 import { enqueue, getQueueStats } from './renderQueue'
+import { sendError, sendStaticFile } from './respond'
 
 const app = express()
 const globalConfig = getConfig()
 
 // Constants
-const REQUEST_TIMEOUT_MS = 30000
 const RENDERX_USER_AGENT = 'RenderX/1.0'
 
 // Rate limiting
@@ -73,13 +74,16 @@ const requestIdMiddleware = (req: Request, res: Response, next: NextFunction): v
     next()
 }
 
-const sendError = (res: Response, statusCode: number, error: string, message?: string): void => {
-    const response: { error: string; message?: string } = { error }
-    if (message) {
-        response.message = message
+// Express 4 ignores a rejected promise from an async handler: the request hangs and Node 20
+// exits the process on the unhandled rejection. Every rejection goes to the error middleware
+// at the bottom of this file instead
+type AsyncHandler = (req: Request, res: Response, next: NextFunction) => Promise<unknown>
+
+const asyncHandler =
+    (handler: AsyncHandler) =>
+    (req: Request, res: Response, next: NextFunction): void => {
+        handler(req, res, next).catch(next)
     }
-    res.status(statusCode).json(response)
-}
 
 const validatePath = (basePath: string, requestedPath: string): string | null => {
     // Assets whose filenames contain spaces or parentheses (common in Vite builds) only
@@ -171,11 +175,10 @@ app.use((_req: Request, res: Response, next: NextFunction) => {
     ;(res as Response & { renderAbortSignal: AbortSignal }).renderAbortSignal = controller.signal
 
     const timeout = setTimeout(() => {
+        // Answer before aborting: renderPage treats an aborted render as an already answered request
+        sendError(res, 504, 'Request timeout', 'The request took too long to process')
         controller.abort()
-        if (!res.headersSent) {
-            sendError(res, 504, 'Request timeout', 'The request took too long to process')
-        }
-    }, REQUEST_TIMEOUT_MS)
+    }, globalConfig.requestTimeoutMs)
 
     const originalEnd = res.end.bind(res)
     res.end = function (chunk?: any, encoding?: any) {
@@ -289,7 +292,7 @@ app.use((req: Request, res: Response, next: () => void) => {
 })
 
 // Health check endpoint
-app.get('/health', async (_req: Request, res: Response) => {
+app.get('/health', asyncHandler(async (_req: Request, res: Response) => {
     const config = getEffectiveConfig()
     const queueStats = getQueueStats()
     const health: {
@@ -325,7 +328,7 @@ app.get('/health', async (_req: Request, res: Response) => {
 
     const statusCode = health.status === 'ok' ? 200 : 503
     res.status(statusCode).json(health)
-})
+}))
 
 const isFilePath = (filePath: string): boolean => {
     // Decode first so an encoded extension is still recognised as an asset request.
@@ -334,24 +337,6 @@ const isFilePath = (filePath: string): boolean => {
 
     const ext = path.extname(decodedPath)
     return ext !== '' && ext !== '/'
-}
-
-// Content-hash pattern: a separator (.|-) followed by an 8+ char token that
-// contains at least one digit, then the extension. Matches webpack-style
-// (main.1a2b3c4d.js) and Vite-style (index-Dea4n0lr.js) hashed assets while
-// excluding non-hashed names like app.production.js or styles.responsive.css.
-const CONTENT_HASH_PATTERN = /[.-](?=[A-Za-z0-9_-]{8,}\.)[A-Za-z0-9_-]*\d[A-Za-z0-9_-]*\.\w+$/
-
-const sendStaticFile = (res: Response, filePath: string): void => {
-    const ext = path.extname(filePath).toLowerCase()
-
-    if (ext === '.html' || ext === '.htm') {
-        res.setHeader('Cache-Control', 'no-cache')
-    } else if (CONTENT_HASH_PATTERN.test(path.basename(filePath))) {
-        res.setHeader('Cache-Control', 'public, max-age=31536000, immutable')
-    }
-
-    res.sendFile(filePath)
 }
 
 const shouldRender = (
@@ -452,6 +437,9 @@ const renderPage = async (
     const cached = await cache.get(cacheKey, 'desktop', effectiveConfig.cacheTtl)
 
     if (cached) {
+        // A cache read that outlived the request timeout has nothing left to answer
+        if (res.headersSent) return true
+
         ;(res as Response & { _cacheHit?: boolean })._cacheHit = true
         res.setHeader('Content-Type', 'text/html; charset=utf-8')
         res.setHeader('Cache-Control', 'no-cache')
@@ -486,6 +474,11 @@ const renderPage = async (
                 return false
             }
             await cache.set(cacheKey, html, 'desktop', effectiveConfig.cacheTtl)
+
+            // The timeout middleware may have answered 504 during the render or the cache write.
+            // The cache is warm for the next visitor, but this response is finished
+            if (res.headersSent) return true
+
             ;(res as Response & { _cacheHit?: boolean })._cacheHit = false
             res.setHeader('Content-Type', 'text/html; charset=utf-8')
             res.setHeader('Cache-Control', 'no-cache')
@@ -494,7 +487,9 @@ const renderPage = async (
         }
     } catch (err) {
         const error = err as Error
-        if (error.message.includes('Render aborted')) return false
+        // Only the timeout middleware aborts a render, and it answers 504 first. Report the
+        // response as handled so the caller does not fall back to the static file
+        if (error.message.includes('Render aborted')) return res.headersSent
         if (error.message.includes('render queue full')) {
             sendError(res, 503, 'Service temporarily unavailable', 'Server at capacity, try again later')
             return true
@@ -506,7 +501,7 @@ const renderPage = async (
 }
 
 // /render endpoint — open, protected by rate limiter
-app.get('/render', async (req: Request, res: Response) => {
+app.get('/render', asyncHandler(async (req: Request, res: Response) => {
     try {
         const url = req.query.url as string | undefined
 
@@ -566,11 +561,18 @@ app.get('/render', async (req: Request, res: Response) => {
         }
 
         await cache.set(url, html, deviceType, effectiveConfig.cacheTtl)
+
+        // The timeout middleware may have answered 504 during the render or the cache write
+        if (res.headersSent) return
+
         res.set('X-Cache', 'MISS')
         res.setHeader('Content-Type', 'text/html; charset=utf-8')
         res.send(html)
     } catch (err) {
         const error = err as Error
+
+        // The timeout middleware already answered 504 and aborted this render
+        if (res.headersSent) return
 
         if (error.message.includes('render queue full')) {
             return sendError(res, 503, 'Service temporarily unavailable', 'Server at capacity, try again later')
@@ -585,10 +587,10 @@ app.get('/render', async (req: Request, res: Response) => {
 
         sendError(res, 500, 'Internal server error', error.message)
     }
-})
+}))
 
 // Cache management endpoints
-app.post('/cache/invalidate', async (req: Request, res: Response) => {
+app.post('/cache/invalidate', asyncHandler(async (req: Request, res: Response) => {
     const { url, device } = req.body as { url?: string; device?: string }
 
     if (!url) {
@@ -606,15 +608,15 @@ app.post('/cache/invalidate', async (req: Request, res: Response) => {
 
     const result = await cache.invalidate(url, deviceType)
     return res.json({ success: result })
-})
+}))
 
-app.post('/cache/clear', async (_req: Request, res: Response) => {
+app.post('/cache/clear', asyncHandler(async (_req: Request, res: Response) => {
     const result = await cache.clear()
     return res.json({ success: result })
-})
+}))
 
 // Main routing middleware
-app.use(async (req: Request, res: Response, next: () => void) => {
+app.use(asyncHandler(async (req: Request, res: Response, next: NextFunction) => {
     // Reject known scanner/bot probes early
     if (isScannerPath(req.path)) {
         return sendError(res, 403, 'Forbidden')
@@ -777,6 +779,39 @@ app.use(async (req: Request, res: Response, next: () => void) => {
     }
 
     return sendError(res, 404, 'Not found')
+}))
+
+// body-parser and res.sendFile put the status they mean on the error they hand to next()
+const httpStatusOf = (error: unknown): number | undefined => {
+    if (typeof error !== 'object' || error === null) return undefined
+
+    const candidate = 'status' in error ? error.status : 'statusCode' in error ? error.statusCode : undefined
+    return typeof candidate === 'number' && candidate >= 400 && candidate < 600 ? candidate : undefined
+}
+
+// Where asyncHandler and Express's own middleware send a throw. A 4xx (malformed JSON body,
+// oversized payload) is the client's problem and already shows in the access log; a 5xx is ours
+// and gets its stack. Express's fallback would print HTML and destroy the socket instead
+app.use((error: unknown, req: Request, res: Response, _next: NextFunction) => {
+    const statusCode = httpStatusOf(error) ?? 500
+    const requestLabel = `${req.method} ${req.originalUrl}`
+
+    if (res.headersSent) {
+        // Usually the timeout middleware answered first and a late write tripped. A finished
+        // response needs nothing more; an unfinished body is in an unknown state, and closing
+        // the socket is the only way to tell the client
+        if (!res.writableEnded) {
+            logger.error(`Error after headers were sent for ${requestLabel}: ${describeError(error)}`)
+            res.destroy()
+        }
+        return
+    }
+
+    if (statusCode >= 500) {
+        logger.error(`Unhandled error for ${requestLabel}: ${describeError(error)}`)
+    }
+
+    sendError(res, statusCode, STATUS_CODES[statusCode] ?? 'Request failed')
 })
 
 // Start server
@@ -809,4 +844,10 @@ process.on('SIGTERM', () => {
 process.on('SIGINT', () => {
     stopCleanupInterval()
     process.exit(0)
+})
+
+// A rejection nobody awaited (a background refresh, a browser event, a timer) must not take
+// the server down with it. Node 20 exits the process by default; log it and keep serving
+process.on('unhandledRejection', reason => {
+    logger.error(`Unhandled promise rejection: ${describeError(reason)}`)
 })

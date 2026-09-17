@@ -55,6 +55,16 @@ RenderX is a TypeScript service that uses Playwright to render client-side appli
     - Minifies HTML
     - Keeps essential content
 
+9. **Response Helpers** (`src/respond.ts`)
+
+    - `sendError` and `sendStaticFile`
+    - Both return without writing when the timeout middleware has already answered the request
+
+10. **Health Check** (`src/healthcheck.ts`)
+
+    - Run by Docker's `HEALTHCHECK`
+    - Resolves the port through the config loader, so a port set only in `config.json` is probed
+
 ### Request Flow
 
 ```

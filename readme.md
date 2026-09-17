@@ -252,6 +252,7 @@ All global settings are optional and will use defaults if not specified:
 | Option                 | Type    | Required | Default   | Description                                                                                                                                    |
 | ---------------------- | ------- | -------- | --------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
 | `port`                 | number  | No       | `8080`    | Server port inside container                                                                                                                   |
+| `requestTimeoutMs`     | number  | No       | `30000`   | Per-request timeout in ms. Past it the request gets `504` and its render is aborted. Must be a positive number; anything else falls back.     |
 | `ssr`                  | boolean | No       | `true`    | Enable or disable SSR globally. Set to `false` to serve static files only (useful as a kill switch when SSR is failing).                        |
 | `ssrExclude`           | array   | No       | `[]`      | Route glob patterns served as pure CSR even when `ssr` is enabled (e.g. `["/app", "/app/*"]`). No render, no cache entry.                       |
 | `parallelRenders`      | number  | No       | `10`      | Maximum number of parallel page renders                                                                                                        |
@@ -276,15 +277,16 @@ Each host configuration supports:
 
 ### Environment Variables
 
-| Variable           | Description                                | Default |
-| ------------------ | ------------------------------------------ | ------- |
-| `SSR`              | Enable/disable SSR (`true`/`false`)        | `true`  |
-| `PORT`             | Server port                                | `8080`  |
-| `PARALLEL_RENDERS` | Max parallel renders                       | `10`    |
-| `LOG_FORMAT`       | Log format (`text`/`json`)                 | `json`  |
-| `LOGS`             | Log level (`none`/`ssr`/`all`)             | `ssr`   |
-| `TIMEOUT_MS`       | Render timeout in ms                       | `10000` |
-| `NODE_ENV`         | Set to `development` for text log default  | -       |
+| Variable             | Description                                                                         | Default |
+| -------------------- | ----------------------------------------------------------------------------------- | ------- |
+| `SSR`                | Enable/disable SSR (`true`/`false`)                                                 | `true`  |
+| `PORT`               | Server port                                                                         | `8080`  |
+| `PARALLEL_RENDERS`   | Max parallel renders                                                                | `10`    |
+| `LOG_FORMAT`         | Log format (`text`/`json`)                                                          | `json`  |
+| `LOGS`               | Log level (`none`/`ssr`/`all`)                                                      | `ssr`   |
+| `TIMEOUT_MS`         | Render timeout in ms                                                                | `10000` |
+| `REQUEST_TIMEOUT_MS` | Per-request timeout in ms, overrides `requestTimeoutMs` in `config.json`            | `30000` |
+| `NODE_ENV`           | Set to `development` for text log default                                           | -       |
 
 ## Caching
 
